@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="620" viewBox="0 0 920 620" role="img" aria-labelledby="title desc">
+  <title id="title">taskctl architecture</title>
+  <desc id="desc">An MCP client talks JSON-RPC over stdio to the taskctl binary. cmd/taskctl wires logging and diagnostics, internal/mcp owns the protocol and tools, internal/store owns migrations and SQLite in WAL mode.</desc>
+  <style>
+    .box { fill: #ffffff; stroke: #57606a; stroke-width: 1.5; rx: 10; }
+    .core { fill: #ddf4ff; stroke: #0969da; }
+    .data { fill: #dafbe1; stroke: #1a7f37; }
+    .client { fill: #fff8c5; stroke: #9a6700; }
+    .label { font: 600 16px -apple-system, "Segoe UI", sans-serif; fill: #1f2328; }
+    .sub { font: 13px ui-monospace, SFMono-Regular, Consolas, monospace; fill: #57606a; }
+    .edge { stroke: #57606a; stroke-width: 1.5; fill: none; marker-end: url(#arrow); }
+    .edge-label { font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; fill: #57606a; }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#57606a"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="920" height="620" fill="#f6f8fa"/>
+
+  <!-- client -->
+  <rect class="box client" x="40" y="60" width="210" height="96"/>
+  <text class="label" x="60" y="94">MCP client</text>
+  <text class="sub" x="60" y="118">OpenCode / any agent</text>
+  <text class="sub" x="60" y="138">initialize → tools/call</text>
+
+  <!-- binary -->
+  <rect class="box core" x="330" y="60" width="230" height="96"/>
+  <text class="label" x="350" y="94">cmd/taskctl</text>
+  <text class="sub" x="350" y="118">flags, signals, doctor</text>
+  <text class="sub" x="350" y="138">stdout = protocol only</text>
+
+  <!-- mcp -->
+  <rect class="box core" x="640" y="60" width="230" height="96"/>
+  <text class="label" x="660" y="94">internal/mcp</text>
+  <text class="sub" x="660" y="118">JSON-RPC, size limit</text>
+  <text class="sub" x="660" y="138">add · list · show · update</text>
+
+  <!-- logging -->
+  <rect class="box" x="330" y="220" width="230" height="82"/>
+  <text class="label" x="350" y="250">internal/logging</text>
+  <text class="sub" x="350" y="274">slog → stderr</text>
+  <text class="sub" x="350" y="292">TASKCTL_LOG_LEVEL</text>
+
+  <!-- store -->
+  <rect class="box core" x="640" y="220" width="230" height="96"/>
+  <text class="label" x="660" y="250">internal/store</text>
+  <text class="sub" x="660" y="274">migrations (user_version)</text>
+  <text class="sub" x="660" y="292">BEGIN IMMEDIATE · limits</text>
+
+  <!-- sqlite -->
+  <rect class="box data" x="640" y="390" width="230" height="110"/>
+  <text class="label" x="660" y="422">SQLite · tasks.db</text>
+  <text class="sub" x="660" y="446">WAL, synchronous=NORMAL</text>
+  <text class="sub" x="660" y="466">dir 0700 · file 0600</text>
+  <text class="sub" x="660" y="486">never deleted</text>
+
+  <!-- edges -->
+  <path class="edge" d="M 250 96 L 328 96"/>
+  <path class="edge" d="M 250 122 L 328 122"/>
+  <text class="edge-label" x="252" y="86">stdio</text>
+  <text class="edge-label" x="252" y="144">JSON-RPC 2.0</text>
+
+  <path class="edge" d="M 560 96 L 638 96"/>
+  <text class="edge-label" x="566" y="86">requests</text>
+
+  <path class="edge" d="M 445 156 L 445 218"/>
+  <text class="edge-label" x="454" y="192">warnings</text>
+
+  <path class="edge" d="M 755 156 L 755 218"/>
+  <text class="edge-label" x="764" y="192">tool handlers</text>
+
+  <path class="edge" d="M 755 316 L 755 388"/>
+  <text class="edge-label" x="764" y="356">database/sql</text>
+
+  <!-- doctor note -->
+  <rect class="box" x="40" y="390" width="480" height="110"/>
+  <text class="label" x="60" y="422">taskctl doctor [--json]</text>
+  <text class="sub" x="60" y="448">schema version · journal mode · permissions</text>
+  <text class="sub" x="60" y="468">writable · quick_check · task counts</text>
+  <text class="sub" x="60" y="488">exit code 1 when a check fails</text>
+  <path class="edge" d="M 520 445 L 638 445"/>
+</svg>

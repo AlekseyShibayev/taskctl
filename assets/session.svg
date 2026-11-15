@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="590" viewBox="0 0 960 590" role="img" aria-labelledby="title desc">
+  <title id="title">taskctl — real MCP session</title>
+  <desc id="desc">A terminal session: initialize, add, update and list over stdio, followed by taskctl doctor.</desc>
+  <defs>
+    <style>
+      .term { fill: #0d1117; }
+      .chrome { fill: #161b22; }
+      .dot1 { fill: #ff5f56; } .dot2 { fill: #ffbd2e; } .dot3 { fill: #27c93f; }
+      .title { font: 13px -apple-system, "Segoe UI", sans-serif; fill: #8b949e; }
+      .prompt { font: 600 14px ui-monospace, SFMono-Regular, Consolas, monospace; fill: #7ee787; }
+      .req { font: 13px ui-monospace, SFMono-Regular, Consolas, monospace; fill: #79c0ff; }
+      .res { font: 13px ui-monospace, SFMono-Regular, Consolas, monospace; fill: #c9d1d9; }
+      .dim { font: 13px ui-monospace, SFMono-Regular, Consolas, monospace; fill: #8b949e; }
+      .ok { font: 13px ui-monospace, SFMono-Regular, Consolas, monospace; fill: #3fb950; }
+      .warn { font: 13px ui-monospace, SFMono-Regular, Consolas, monospace; fill: #d29922; }
+    </style>
+  </defs>
+
+  <rect class="term" x="0" y="0" width="960" height="590" rx="12"/>
+  <rect class="chrome" x="0" y="0" width="960" height="36" rx="12"/>
+  <rect class="chrome" x="0" y="24" width="960" height="12"/>
+  <circle class="dot1" cx="22" cy="18" r="6"/>
+  <circle class="dot2" cx="44" cy="18" r="6"/>
+  <circle class="dot3" cx="66" cy="18" r="6"/>
+  <text class="title" x="480" y="23" text-anchor="middle">taskctl mcp — real session</text>
+
+  <text class="prompt" x="28" y="76">$ taskctl mcp</text>
+
+  <text class="req" x="28" y="112">→ initialize {"protocolVersion":"2025-06-18", ...}</text>
+  <text class="res" x="28" y="134">← "serverInfo":{"name":"taskctl","version":"0.1.0"}</text>
+
+  <text class="req" x="28" y="170">→ tools/call add {"name":"Починить doctor","content":"Проверять права и WAL"}</text>
+  <text class="res" x="28" y="192">← {"id":1,"name":"Починить doctor","status":"create","created_at":"…"}</text>
+
+  <text class="req" x="28" y="228">→ tools/call update {"id":1,"status":"in_progress"}</text>
+  <text class="res" x="28" y="250">← {"id":1,"name":"Починить doctor","status":"in_progress","created_at":"…"}</text>
+
+  <text class="req" x="28" y="286">→ tools/call list {"status":"in_progress"}</text>
+  <text class="res" x="28" y="308">← {"tasks":[{…}],"limit":50,"offset":0,"has_more":false}</text>
+
+  <text class="prompt" x="28" y="356">$ taskctl doctor</text>
+  <text class="res" x="28" y="380">db: ~/.local/share/taskctl/tasks.db</text>
+  <text class="res" x="28" y="402">schema: 1 (expected 1)    journal_mode: wal</text>
+  <text class="res" x="28" y="424">tasks: 1    in_progress 1</text>
+  <text class="ok" x="28" y="456">ok   permissions   dir 0700, file 0600</text>
+  <text class="ok" x="28" y="478">ok   writable      write transaction accepted</text>
+  <text class="ok" x="28" y="500">ok   integrity     ok</text>
+  <text class="ok" x="28" y="530">ok</text>
+
+  <text class="dim" x="28" y="566">logs go to stderr · stdout carries only newline-delimited JSON-RPC</text>
+</svg>
