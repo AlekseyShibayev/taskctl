@@ -134,7 +134,9 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	}
 
 	var wg sync.WaitGroup
-	jobs := make(chan callJob)
+	// Buffered so the read loop is never stuck handing a request to a busy
+	// worker: notifications/cancelled must still get through.
+	jobs := make(chan callJob, 256)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()

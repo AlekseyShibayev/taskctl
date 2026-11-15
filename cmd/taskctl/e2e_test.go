@@ -29,10 +29,7 @@ func TestE2EStdioSession(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping E2E in short mode")
 	}
-	bin := filepath.Join(t.TempDir(), "taskctl")
-	if output, err := exec.Command("go", "build", "-trimpath", "-o", bin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build binary: %v\n%s", err, output)
-	}
+	bin := buildTaskctl(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -215,10 +212,7 @@ func TestE2EDoctor(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping E2E in short mode")
 	}
-	bin := filepath.Join(t.TempDir(), "taskctl")
-	if output, err := exec.Command("go", "build", "-trimpath", "-o", bin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build binary: %v\n%s", err, output)
-	}
+	bin := buildTaskctl(t)
 
 	dataDir := t.TempDir()
 	cmd := exec.Command(bin, "doctor", "--json")
@@ -236,4 +230,15 @@ func TestE2EDoctor(t *testing.T) {
 	if !report.OK {
 		t.Errorf("doctor not ok: %s", output)
 	}
+}
+
+// buildTaskctl compiles the command under test into a temporary directory.
+func buildTaskctl(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "taskctl")
+	output, err := exec.Command("go", "build", "-trimpath", "-o", bin, ".").CombinedOutput()
+	if err != nil {
+		t.Fatalf("build binary: %v\n%s", err, output)
+	}
+	return bin
 }

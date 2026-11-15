@@ -19,7 +19,8 @@ First tagged release.
   (`PRAGMA user_version`) and private file permissions (`0700`/`0600`).
 - `doctor` diagnostics with human-readable and `--json` output.
 - Graceful shutdown on SIGINT/SIGTERM, including a WAL checkpoint.
-- E2E test that drives the built binary over a real stdio session.
+- E2E test that drives the built binary over a real stdio session, plus a
+  smoke test with the official MCP Go client.
 
 ### Fixed
 

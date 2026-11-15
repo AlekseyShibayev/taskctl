@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -659,5 +660,32 @@ func TestEmptyInput(t *testing.T) {
 	}
 	if out.Len() != 0 {
 		t.Fatalf("output = %q", out.String())
+	}
+}
+
+func TestServeStopsWhenContextCanceled(t *testing.T) {
+	st := newStore(t)
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer writer.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var out bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- mcp.NewServer(st, "test", nil).Serve(ctx, reader, &out)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not stop after cancellation")
 	}
 }
