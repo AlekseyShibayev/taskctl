@@ -2,12 +2,17 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"github.com/AlekseyShibayev/taskctl/internal/store"
 )
@@ -261,7 +266,7 @@ func TestUpdateFields(t *testing.T) {
 }
 
 func TestUpdateTransitions(t *testing.T) {
-	all := store.Statuses
+	all := store.Statuses()
 
 	// moveTo drives a fresh task into the requested status.
 	moveTo := func(t *testing.T, st *store.Store, target store.Status) store.Task {
@@ -436,4 +441,331 @@ func contains(values []store.Status, want store.Status) bool {
 		}
 	}
 	return false
+}
+
+func TestDatabasePermissionsAndDirectory(t *testing.T) {
+	base := t.TempDir()
+	dbPath := filepath.Join(base, "nested", "tasks.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+
+	dirInfo, err := os.Stat(filepath.Dir(dbPath))
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	if mode := dirInfo.Mode().Perm(); mode != 0o700 {
+		t.Errorf("directory mode = %04o, want 0700", mode)
+	}
+	fileInfo, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("stat file: %v", err)
+	}
+	if mode := fileInfo.Mode().Perm(); mode != 0o600 {
+		t.Errorf("database mode = %04o, want 0600", mode)
+	}
+}
+
+func TestWALAndSchemaVersion(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	version, err := st.SchemaVersion(ctx)
+	if err != nil {
+		t.Fatalf("schema version: %v", err)
+	}
+	if version != store.SupportedSchemaVersion() {
+		t.Errorf("schema version = %d, want %d", version, store.SupportedSchemaVersion())
+	}
+	mode, err := st.JournalMode(ctx)
+	if err != nil {
+		t.Fatalf("journal mode: %v", err)
+	}
+	if !strings.EqualFold(mode, "wal") {
+		t.Errorf("journal mode = %q, want wal", mode)
+	}
+	if err := st.CheckWritable(ctx); err != nil {
+		t.Errorf("check writable: %v", err)
+	}
+	if result, err := st.QuickCheck(ctx); err != nil || result != "ok" {
+		t.Errorf("quick check = %q, %v", result, err)
+	}
+}
+
+func TestSchemaMigrationPersistsVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.db")
+	first, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	version, err := first.SchemaVersion(context.Background())
+	if err != nil {
+		t.Fatalf("schema version: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	second, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer second.Close()
+	reopened, err := second.SchemaVersion(context.Background())
+	if err != nil {
+		t.Fatalf("schema version after reopen: %v", err)
+	}
+	if reopened != version {
+		t.Errorf("version after reopen = %d, want %d", reopened, version)
+	}
+}
+
+func TestNameAndContentLimits(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	exactName := strings.Repeat("n", store.MaxNameBytes)
+	if _, err := st.Add(ctx, exactName, nil); err != nil {
+		t.Errorf("name at the limit: %v", err)
+	}
+	tooLong := strings.Repeat("n", store.MaxNameBytes+1)
+	_, err := st.Add(ctx, tooLong, nil)
+	requireCode(t, err, store.CodeInvalidArgument)
+
+	exactContent := strings.Repeat("c", store.MaxContentBytes)
+	if _, err := st.Add(ctx, "big", &exactContent); err != nil {
+		t.Errorf("content at the limit: %v", err)
+	}
+	tooBig := strings.Repeat("c", store.MaxContentBytes+1)
+	_, err = st.Add(ctx, "bigger", &tooBig)
+	requireCode(t, err, store.CodeInvalidArgument)
+}
+
+func TestUnicodeAndTrimming(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	task, err := st.Add(ctx, "  задача 🚀  ", nil)
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if task.Name != "задача 🚀" {
+		t.Errorf("name = %q, want trimmed unicode name", task.Name)
+	}
+
+	emoji := strings.Repeat("🚀", 300) // 1200 bytes > 1 KiB
+	_, err = st.Add(ctx, emoji, nil)
+	requireCode(t, err, store.CodeInvalidArgument)
+
+	invalid := string([]byte{0xff, 0xfe})
+	_, err = st.Add(ctx, invalid, nil)
+	requireCode(t, err, store.CodeInvalidArgument)
+
+	content := invalid
+	_, err = st.Add(ctx, "valid", &content)
+	requireCode(t, err, store.CodeInvalidArgument)
+
+	renamed := " updated "
+	updated, err := st.Update(ctx, task.ID, store.Patch{Name: &renamed})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if updated.Name != "updated" {
+		t.Errorf("updated name = %q, want trimmed", updated.Name)
+	}
+}
+
+func TestListExtremeLimitsAndOffset(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	const tasks = 3
+	for i := 0; i < tasks; i++ {
+		mustAdd(t, st, fmt.Sprintf("task-%d", i))
+	}
+
+	one, err := st.List(ctx, store.ListFilter{Limit: 1})
+	if err != nil {
+		t.Fatalf("limit 1: %v", err)
+	}
+	if len(one.Tasks) != 1 || !one.HasMore {
+		t.Errorf("limit 1 page = %+v", one)
+	}
+
+	largest, err := st.List(ctx, store.ListFilter{Limit: store.MaxLimit})
+	if err != nil {
+		t.Fatalf("limit max: %v", err)
+	}
+	if len(largest.Tasks) != tasks || largest.HasMore {
+		t.Errorf("limit max page = %+v", largest)
+	}
+
+	beyond, err := st.List(ctx, store.ListFilter{Offset: tasks + 10})
+	if err != nil {
+		t.Fatalf("offset beyond: %v", err)
+	}
+	if len(beyond.Tasks) != 0 || beyond.HasMore {
+		t.Errorf("offset beyond page = %+v", beyond)
+	}
+}
+
+func TestStatsCountsUnknownStatus(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO tasks (name, content, status, created_at) VALUES (?, ?, ?, ?)`,
+		"bad", "", "returned", "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+
+	reopened, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	stats, err := reopened.Stats(context.Background())
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if stats.Total != 1 || stats.Unknown != 1 {
+		t.Errorf("stats = %+v, want total 1 and unknown 1", stats)
+	}
+	if _, ok := stats.ByStatus[store.Status("returned")]; ok {
+		t.Errorf("unknown status leaked into by_status: %v", stats.ByStatus)
+	}
+}
+
+func TestBrokenCreatedAtIsReported(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO tasks (name, content, status, created_at) VALUES (?, ?, ?, ?)`,
+		"bad", "", "create", "not-a-date"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+
+	reopened, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	_, err = reopened.Get(context.Background(), 1)
+	if err == nil || !strings.Contains(err.Error(), "parse created_at") {
+		t.Fatalf("get = %v, want a parse error", err)
+	}
+}
+
+func TestUpdateAcrossTwoStores(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.db")
+	first, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open first: %v", err)
+	}
+	defer first.Close()
+	second, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open second: %v", err)
+	}
+	defer second.Close()
+
+	task := mustAdd(t, first, "task")
+	inProgress := store.StatusInProgress
+	name := "renamed"
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, err := first.Update(context.Background(), task.ID, store.Patch{Status: &inProgress})
+		errs <- err
+	}()
+	go func() {
+		defer wg.Done()
+		_, err := second.Update(context.Background(), task.ID, store.Patch{Name: &name})
+		errs <- err
+	}()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("update: %v", err)
+		}
+	}
+
+	got, err := first.Get(context.Background(), task.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Name != name || got.Status != store.StatusInProgress {
+		t.Fatalf("lost update across stores: name = %q, status = %s", got.Name, got.Status)
+	}
+}
+
+func TestOpenTightensLoosePermissions(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "taskctl")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("chmod dir: %v", err)
+	}
+	dbPath := filepath.Join(dir, "tasks.db")
+	if err := os.WriteFile(dbPath, nil, 0o644); err != nil {
+		t.Fatalf("create file: %v", err)
+	}
+	if err := os.Chmod(dbPath, 0o644); err != nil {
+		t.Fatalf("chmod file: %v", err)
+	}
+
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+
+	dirInfo, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	if mode := dirInfo.Mode().Perm(); mode != 0o700 {
+		t.Errorf("directory mode = %04o, want 0700", mode)
+	}
+	fileInfo, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("stat file: %v", err)
+	}
+	if mode := fileInfo.Mode().Perm(); mode != 0o600 {
+		t.Errorf("database mode = %04o, want 0600", mode)
+	}
 }

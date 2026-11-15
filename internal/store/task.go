@@ -5,22 +5,34 @@ import "time"
 // Status is the lifecycle state of a task.
 type Status string
 
+// Task statuses in lifecycle order.
 const (
 	StatusCreate     Status = "create"
 	StatusInProgress Status = "in_progress"
 	StatusDone       Status = "done"
 )
 
-// Statuses lists every valid status in lifecycle order.
-var Statuses = []Status{
+// allStatuses lists every valid status in lifecycle order. It stays private so
+// no package can mutate the canonical list.
+var allStatuses = []Status{
 	StatusCreate,
 	StatusInProgress,
 	StatusDone,
 }
 
+// Statuses returns a copy of the valid statuses in lifecycle order.
+func Statuses() []Status {
+	out := make([]Status, len(allStatuses))
+	copy(out, allStatuses)
+	return out
+}
+
+// statuses is the internal read-only view used inside this package.
+func statuses() []Status { return allStatuses }
+
 // Valid reports whether s is a known status.
 func (s Status) Valid() bool {
-	for _, known := range Statuses {
+	for _, known := range allStatuses {
 		if s == known {
 			return true
 		}
@@ -48,7 +60,7 @@ func (s Status) CanTransitionTo(next Status) bool {
 func ParseStatus(raw string) (Status, error) {
 	s := Status(raw)
 	if !s.Valid() {
-		return "", invalidArgumentf("unknown status %q: expected one of %v", raw, Statuses)
+		return "", invalidArgumentf("unknown status %q: expected one of %v", raw, Statuses())
 	}
 	return s, nil
 }

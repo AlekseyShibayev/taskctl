@@ -10,10 +10,21 @@ import (
 	"github.com/AlekseyShibayev/taskctl/internal/store"
 )
 
+// toolAnnotations carries MCP hints for a tool (protocol 2025-06-18).
+type toolAnnotations struct {
+	Title           string `json:"title,omitempty"`
+	ReadOnlyHint    bool   `json:"readOnlyHint"`
+	DestructiveHint bool   `json:"destructiveHint"`
+	IdempotentHint  bool   `json:"idempotentHint"`
+	OpenWorldHint   bool   `json:"openWorldHint"`
+}
+
 type toolDefinition struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	InputSchema map[string]any `json:"inputSchema"`
+	Name        string           `json:"name"`
+	Title       string           `json:"title,omitempty"`
+	Description string           `json:"description"`
+	InputSchema map[string]any   `json:"inputSchema"`
+	Annotations *toolAnnotations `json:"annotations,omitempty"`
 }
 
 type listToolsResult struct {
@@ -44,23 +55,49 @@ var toolHandlers = map[string]toolHandler{
 	"update": updateTool,
 }
 
+// readOnly is shared by the tools that never write.
+var readOnly = &toolAnnotations{
+	ReadOnlyHint:    true,
+	DestructiveHint: false,
+	IdempotentHint:  true,
+	OpenWorldHint:   false,
+}
+
 func toolDefinitions() []toolDefinition {
 	return []toolDefinition{
 		{
 			Name:        "add",
+			Title:       "Add task",
 			Description: "Create a task. A new task starts in status create; name is required, content is optional.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"name":    map[string]any{"type": "string", "description": "Task name, must not be empty."},
-					"content": map[string]any{"type": "string", "description": "Task description."},
+					"name": map[string]any{
+						"type":        "string",
+						"description": "Task name, must not be empty.",
+						"minLength":   1,
+						"maxLength":   store.MaxNameBytes,
+					},
+					"content": map[string]any{
+						"type":        "string",
+						"description": "Task description.",
+						"maxLength":   store.MaxContentBytes,
+					},
 				},
 				"required":             []string{"name"},
 				"additionalProperties": false,
 			},
+			Annotations: &toolAnnotations{
+				Title:           "Add task",
+				ReadOnlyHint:    false,
+				DestructiveHint: false,
+				IdempotentHint:  false,
+				OpenWorldHint:   false,
+			},
 		},
 		{
-			Name: "list",
+			Name:  "list",
+			Title: "List tasks",
 			Description: "List tasks ordered by id. Optional status filter and pagination. " +
 				"Returns {tasks, limit, offset, has_more}.",
 			InputSchema: map[string]any{
@@ -72,9 +109,11 @@ func toolDefinitions() []toolDefinition {
 				},
 				"additionalProperties": false,
 			},
+			Annotations: readOnly,
 		},
 		{
 			Name:        "show",
+			Title:       "Show task",
 			Description: "Show one task by id.",
 			InputSchema: map[string]any{
 				"type": "object",
@@ -84,9 +123,11 @@ func toolDefinitions() []toolDefinition {
 				"required":             []string{"id"},
 				"additionalProperties": false,
 			},
+			Annotations: readOnly,
 		},
 		{
-			Name: "update",
+			Name:  "update",
+			Title: "Update task",
 			Description: "Update a task. Only the provided fields change. " +
 				"Allowed status moves: create->in_progress, in_progress->create (back for rework), " +
 				"in_progress->done.",
@@ -94,20 +135,28 @@ func toolDefinitions() []toolDefinition {
 				"type": "object",
 				"properties": map[string]any{
 					"id":      map[string]any{"type": "integer", "minimum": 1},
-					"name":    map[string]any{"type": "string", "minLength": 1},
-					"content": map[string]any{"type": "string"},
+					"name":    map[string]any{"type": "string", "minLength": 1, "maxLength": store.MaxNameBytes},
+					"content": map[string]any{"type": "string", "maxLength": store.MaxContentBytes},
 					"status":  map[string]any{"type": "string", "enum": statusEnum()},
 				},
 				"required":             []string{"id"},
 				"additionalProperties": false,
+			},
+			Annotations: &toolAnnotations{
+				Title:           "Update task",
+				ReadOnlyHint:    false,
+				DestructiveHint: false,
+				IdempotentHint:  true,
+				OpenWorldHint:   false,
 			},
 		},
 	}
 }
 
 func statusEnum() []string {
-	values := make([]string, len(store.Statuses))
-	for i, status := range store.Statuses {
+	statuses := store.Statuses()
+	values := make([]string, len(statuses))
+	for i, status := range statuses {
 		values[i] = string(status)
 	}
 	return values
@@ -115,13 +164,16 @@ func statusEnum() []string {
 
 func addTool(ctx context.Context, st *store.Store, raw json.RawMessage) (any, error) {
 	var args struct {
-		Name    string  `json:"name"`
+		Name    *string `json:"name"`
 		Content *string `json:"content"`
 	}
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, err
 	}
-	return st.Add(ctx, args.Name, args.Content)
+	if args.Name == nil {
+		return nil, requiredArgumentf("name")
+	}
+	return st.Add(ctx, *args.Name, args.Content)
 }
 
 func listTool(ctx context.Context, st *store.Store, raw json.RawMessage) (any, error) {
@@ -152,6 +204,12 @@ func listTool(ctx context.Context, st *store.Store, raw json.RawMessage) (any, e
 		filter.Limit = *args.Limit
 	}
 	if args.Offset != nil {
+		if *args.Offset < 0 {
+			return nil, &store.Error{
+				Code:    store.CodeInvalidArgument,
+				Message: "offset must not be negative",
+			}
+		}
 		filter.Offset = *args.Offset
 	}
 	return st.List(ctx, filter)
@@ -164,11 +222,10 @@ func showTool(ctx context.Context, st *store.Store, raw json.RawMessage) (any, e
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, err
 	}
-	var id int64
-	if args.ID != nil {
-		id = *args.ID
+	if args.ID == nil {
+		return nil, requiredArgumentf("id")
 	}
-	return st.Get(ctx, id)
+	return st.Get(ctx, *args.ID)
 }
 
 func updateTool(ctx context.Context, st *store.Store, raw json.RawMessage) (any, error) {
@@ -181,6 +238,9 @@ func updateTool(ctx context.Context, st *store.Store, raw json.RawMessage) (any,
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, err
 	}
+	if args.ID == nil {
+		return nil, requiredArgumentf("id")
+	}
 
 	patch := store.Patch{Name: args.Name, Content: args.Content}
 	if args.Status != nil {
@@ -190,11 +250,13 @@ func updateTool(ctx context.Context, st *store.Store, raw json.RawMessage) (any,
 		}
 		patch.Status = &status
 	}
-	var id int64
-	if args.ID != nil {
-		id = *args.ID
-	}
-	return st.Update(ctx, id, patch)
+	return st.Update(ctx, *args.ID, patch)
+}
+
+// requiredArgumentf reports a missing mandatory argument separately from a
+// malformed one: "id is required" is not "id must be a positive integer".
+func requiredArgumentf(name string) *store.Error {
+	return &store.Error{Code: store.CodeInvalidArgument, Message: name + " is required"}
 }
 
 // decodeArgs decodes tool arguments strictly, rejecting unknown fields.

@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -112,5 +114,71 @@ func TestMCPCommand(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "taskctl", "tasks.db")); err != nil {
 		t.Errorf("database file: %v", err)
+	}
+}
+
+func TestDoctorJSON(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", dir)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"doctor", "--json"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code = %d, stderr = %s", code, stderr.String())
+	}
+	var report struct {
+		OK                    bool   `json:"ok"`
+		DB                    string `json:"db"`
+		SchemaVersion         int    `json:"schema_version"`
+		ExpectedSchemaVersion int    `json:"expected_schema_version"`
+		JournalMode           string `json:"journal_mode"`
+		Checks                []struct {
+			Name   string `json:"name"`
+			OK     bool   `json:"ok"`
+			Detail string `json:"detail"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("decode JSON: %v (%s)", err, stdout.String())
+	}
+	if !report.OK {
+		t.Errorf("report not ok: %+v", report)
+	}
+	if report.DB != filepath.Join(dir, "taskctl", "tasks.db") {
+		t.Errorf("db = %q", report.DB)
+	}
+	if report.SchemaVersion != report.ExpectedSchemaVersion || report.SchemaVersion == 0 {
+		t.Errorf("schema = %d, expected %d", report.SchemaVersion, report.ExpectedSchemaVersion)
+	}
+	if !strings.EqualFold(report.JournalMode, "wal") {
+		t.Errorf("journal mode = %q", report.JournalMode)
+	}
+	names := make([]string, len(report.Checks))
+	for i, check := range report.Checks {
+		names[i] = check.Name
+		if !check.OK {
+			t.Errorf("check %s failed: %s", check.Name, check.Detail)
+		}
+	}
+	if strings.Join(names, ",") != "schema,journal_mode,permissions,writable,integrity" {
+		t.Errorf("checks = %v", names)
+	}
+}
+
+func TestDoctorUnknownFlag(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"doctor", "--nope"}, strings.NewReader(""), &stdout, &stderr); code != 2 {
+		t.Errorf("exit code = %d, want 2", code)
+	}
+}
+
+func TestMCPStopsOnCancelledContext(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", dir)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var stdout, stderr bytes.Buffer
+	if code := runContext(ctx, []string{"mcp"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code = %d, stderr = %s", code, stderr.String())
 	}
 }

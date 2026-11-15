@@ -1,3 +1,4 @@
+// Package store owns the SQLite database and the task lifecycle rules.
 package store
 
 import "fmt"

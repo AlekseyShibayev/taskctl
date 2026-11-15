@@ -2,8 +2,11 @@ package mcp_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -53,10 +56,35 @@ func encodeTool(id int, name string, args any) string {
 
 func runServer(t *testing.T, st *store.Store, lines ...string) []rpcEnvelope {
 	t.Helper()
+	initLine := encodeRequest(0, "initialize", map[string]any{"protocolVersion": "2025-06-18"})
+	envelopes := runServerRaw(t, st, append([]string{initLine}, lines...)...)
+	rest := make([]rpcEnvelope, 0, len(envelopes))
+	for _, envelope := range envelopes {
+		if string(envelope.ID) == "0" {
+			continue
+		}
+		rest = append(rest, envelope)
+	}
+	// tools/call runs concurrently, so responses may arrive out of order.
+	sort.SliceStable(rest, func(i, j int) bool { return numericID(rest[i].ID) < numericID(rest[j].ID) })
+	return rest
+}
+
+// numericID orders the integer ids used by the tests; non-numeric ids sort last.
+func numericID(raw json.RawMessage) int {
+	value, err := strconv.Atoi(string(raw))
+	if err != nil {
+		return int(^uint(0) >> 1)
+	}
+	return value
+}
+
+func runServerRaw(t *testing.T, st *store.Store, lines ...string) []rpcEnvelope {
+	t.Helper()
 	var out bytes.Buffer
-	server := mcp.NewServer(st, "test")
+	server := mcp.NewServer(st, "test", nil)
 	input := strings.Join(lines, "\n") + "\n"
-	if err := server.Serve(strings.NewReader(input), &out); err != nil {
+	if err := server.Serve(context.Background(), strings.NewReader(input), &out); err != nil {
 		t.Fatalf("serve: %v", err)
 	}
 	return decodeEnvelopes(t, out.Bytes())
@@ -120,7 +148,7 @@ func requireToolError(t *testing.T, envelope rpcEnvelope, code string) {
 
 func TestInitialize(t *testing.T) {
 	st := newStore(t)
-	envelopes := runServer(t, st, encodeRequest(1, "initialize", map[string]any{
+	envelopes := runServerRaw(t, st, encodeRequest(1, "initialize", map[string]any{
 		"protocolVersion": "2025-03-26",
 		"capabilities":    map[string]any{},
 		"clientInfo":      map[string]any{"name": "test", "version": "1"},
@@ -158,7 +186,7 @@ func TestInitialize(t *testing.T) {
 		t.Error("instructions must not be empty")
 	}
 
-	fallback := runServer(t, st, encodeRequest(2, "initialize", map[string]any{
+	fallback := runServerRaw(t, st, encodeRequest(2, "initialize", map[string]any{
 		"protocolVersion": "1999-01-01",
 	}))
 	if len(fallback) != 1 {
@@ -239,7 +267,7 @@ func TestToolsList(t *testing.T) {
 	}
 	listStatus := properties("list")["status"].(map[string]any)
 	enum, _ := listStatus["enum"].([]any)
-	if len(enum) != len(store.Statuses) {
+	if len(enum) != len(store.Statuses()) {
 		t.Errorf("list status enum = %v", enum)
 	}
 
@@ -248,7 +276,7 @@ func TestToolsList(t *testing.T) {
 	}
 	updateStatus := properties("update")["status"].(map[string]any)
 	updateEnum, _ := updateStatus["enum"].([]any)
-	if len(updateEnum) != len(store.Statuses) {
+	if len(updateEnum) != len(store.Statuses()) {
 		t.Errorf("update status enum = %v", updateEnum)
 	}
 	for _, value := range updateEnum {
@@ -437,7 +465,7 @@ func TestArgumentAndDispatchErrors(t *testing.T) {
 
 func TestNotificationsAndPing(t *testing.T) {
 	st := newStore(t)
-	envelopes := runServer(t, st,
+	envelopes := runServerRaw(t, st,
 		encodeRequest(1, "initialize", map[string]any{"protocolVersion": "2025-06-18"}),
 		encodeRequest(nil, "notifications/initialized", nil),
 		encodeRequest(nil, "unknown/notification", nil),
@@ -454,7 +482,7 @@ func TestNotificationsAndPing(t *testing.T) {
 		t.Errorf("ping error = %+v", envelopes[2].Error)
 	}
 
-	onlyNotification := runServer(t, st, encodeRequest(nil, "notifications/initialized", nil))
+	onlyNotification := runServerRaw(t, st, encodeRequest(nil, "notifications/initialized", nil))
 	if len(onlyNotification) != 0 {
 		t.Fatalf("notification produced %d responses", len(onlyNotification))
 	}
@@ -468,26 +496,165 @@ func TestStringID(t *testing.T) {
 	}
 }
 
-func TestParseError(t *testing.T) {
+func TestParseErrorDoesNotStopServer(t *testing.T) {
 	st := newStore(t)
-	var out bytes.Buffer
-	server := mcp.NewServer(st, "test")
-	if err := server.Serve(strings.NewReader("{invalid\n"), &out); err == nil {
-		t.Fatal("expected an error for malformed input")
+	envelopes := runServerRaw(t, st,
+		"{invalid",
+		encodeRequest(1, "initialize", map[string]any{"protocolVersion": "2025-06-18"}),
+		encodeRequest(2, "tools/list", nil),
+	)
+	if len(envelopes) != 3 {
+		t.Fatalf("responses = %d, want 3", len(envelopes))
 	}
-	envelopes := decodeEnvelopes(t, out.Bytes())
-	if len(envelopes) != 1 || envelopes[0].Error == nil || envelopes[0].Error.Code != -32700 {
-		t.Fatalf("envelopes = %+v", envelopes)
+	if envelopes[0].Error == nil || envelopes[0].Error.Code != -32700 {
+		t.Fatalf("parse error = %+v", envelopes[0].Error)
 	}
 	if string(envelopes[0].ID) != "null" {
 		t.Errorf("parse error id = %s, want null", envelopes[0].ID)
+	}
+	if string(envelopes[1].ID) != "1" || envelopes[1].Error != nil {
+		t.Errorf("initialize after parse error = %+v", envelopes[1])
+	}
+	if string(envelopes[2].ID) != "2" || envelopes[2].Error != nil {
+		t.Errorf("request after parse error = %+v", envelopes[2])
+	}
+}
+
+func TestInvalidJSONRPCVersion(t *testing.T) {
+	st := newStore(t)
+	envelopes := runServerRaw(t, st,
+		`{"jsonrpc":"1.0","id":1,"method":"ping"}`,
+		`{"id":2,"method":"ping"}`,
+		encodeRequest(3, "ping", nil),
+	)
+	if len(envelopes) != 3 {
+		t.Fatalf("responses = %d, want 3", len(envelopes))
+	}
+	for i := 0; i < 2; i++ {
+		if envelopes[i].Error == nil || envelopes[i].Error.Code != -32600 {
+			t.Errorf("response %d = %+v, want -32600", i, envelopes[i].Error)
+		}
+	}
+	if envelopes[2].Error != nil {
+		t.Errorf("ping after invalid requests = %+v", envelopes[2].Error)
+	}
+}
+
+func TestInitializeRequired(t *testing.T) {
+	st := newStore(t)
+	envelopes := runServerRaw(t, st,
+		encodeTool(1, "list", map[string]any{}),
+		encodeRequest(2, "tools/list", nil),
+	)
+	if len(envelopes) != 2 {
+		t.Fatalf("responses = %d, want 2", len(envelopes))
+	}
+	for _, envelope := range envelopes {
+		if envelope.Error == nil || envelope.Error.Code != -32002 {
+			t.Errorf("response = %+v, want -32002", envelope.Error)
+		}
+	}
+}
+
+func TestOversizedMessageRejected(t *testing.T) {
+	st := newStore(t)
+	oversized := `{"jsonrpc":"2.0","id":1,"method":"ping","params":{"pad":"` +
+		strings.Repeat("x", 5<<20) + `"}}`
+	envelopes := runServerRaw(t, st,
+		oversized,
+		encodeRequest(2, "initialize", map[string]any{"protocolVersion": "2025-06-18"}),
+	)
+	if len(envelopes) != 2 {
+		t.Fatalf("responses = %d, want 2", len(envelopes))
+	}
+	if envelopes[0].Error == nil || envelopes[0].Error.Code != -32600 {
+		t.Fatalf("oversized error = %+v", envelopes[0].Error)
+	}
+	if !strings.Contains(envelopes[0].Error.Message, "maximum size") {
+		t.Errorf("message = %q", envelopes[0].Error.Message)
+	}
+	if envelopes[1].Error != nil || string(envelopes[1].ID) != "2" {
+		t.Errorf("request after oversized message = %+v", envelopes[1])
+	}
+}
+
+func TestRequiredArguments(t *testing.T) {
+	st := newStore(t)
+	envelopes := runServer(t, st,
+		encodeTool(1, "show", map[string]any{}),
+		encodeTool(2, "update", map[string]any{}),
+		encodeTool(3, "add", map[string]any{}),
+	)
+	if len(envelopes) != 3 {
+		t.Fatalf("responses = %d, want 3", len(envelopes))
+	}
+	for i, envelope := range envelopes {
+		payload, isError := toolPayload(t, envelope)
+		if !isError || payload["code"] != store.CodeInvalidArgument {
+			t.Errorf("response %d = %v (isError %v)", i, payload, isError)
+			continue
+		}
+		message, _ := payload["message"].(string)
+		if !strings.Contains(message, "is required") {
+			t.Errorf("response %d message = %q, want an explicit required-argument error", i, message)
+		}
+	}
+}
+
+func TestToolMetadata(t *testing.T) {
+	st := newStore(t)
+	envelopes := runServer(t, st, encodeRequest(1, "tools/list", nil))
+	var result struct {
+		Tools []struct {
+			Name        string `json:"name"`
+			Title       string `json:"title"`
+			Annotations struct {
+				ReadOnlyHint    bool `json:"readOnlyHint"`
+				DestructiveHint bool `json:"destructiveHint"`
+				IdempotentHint  bool `json:"idempotentHint"`
+				OpenWorldHint   bool `json:"openWorldHint"`
+			} `json:"annotations"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(envelopes[0].Result, &result); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	byName := map[string]int{}
+	for i, tool := range result.Tools {
+		byName[tool.Name] = i
+		if tool.Title == "" {
+			t.Errorf("%s has no title", tool.Name)
+		}
+	}
+	readOnly := map[string]bool{"list": true, "show": true, "add": false, "update": false}
+	for name, wantReadOnly := range readOnly {
+		tool := result.Tools[byName[name]]
+		if tool.Annotations.ReadOnlyHint != wantReadOnly {
+			t.Errorf("%s readOnlyHint = %v, want %v", name, tool.Annotations.ReadOnlyHint, wantReadOnly)
+		}
+		if tool.Annotations.DestructiveHint {
+			t.Errorf("%s must not be destructive", name)
+		}
+	}
+	if !result.Tools[byName["update"]].Annotations.IdempotentHint {
+		t.Error("update must be idempotent")
+	}
+}
+
+func TestCancelledContextReturns(t *testing.T) {
+	st := newStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var out bytes.Buffer
+	if err := mcp.NewServer(st, "test", nil).Serve(ctx, strings.NewReader(""), &out); err != nil {
+		t.Fatalf("serve: %v", err)
 	}
 }
 
 func TestEmptyInput(t *testing.T) {
 	st := newStore(t)
 	var out bytes.Buffer
-	if err := mcp.NewServer(st, "test").Serve(strings.NewReader(""), &out); err != nil {
+	if err := mcp.NewServer(st, "test", nil).Serve(context.Background(), strings.NewReader(""), &out); err != nil {
 		t.Fatalf("serve: %v", err)
 	}
 	if out.Len() != 0 {

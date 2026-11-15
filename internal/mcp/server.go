@@ -1,11 +1,16 @@
 package mcp
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"sync"
+	"time"
 
 	"github.com/AlekseyShibayev/taskctl/internal/store"
 )
@@ -19,10 +24,23 @@ const (
 
 // JSON-RPC error codes.
 const (
-	codeParseError     = -32700
-	codeMethodNotFound = -32601
-	codeInvalidParams  = -32602
+	codeParseError           = -32700
+	codeInvalidRequest       = -32600
+	codeMethodNotFound       = -32601
+	codeInvalidParams        = -32602
+	codeServerNotInitialized = -32002
+	codeRequestCancelled     = -32800
 )
+
+// maxMessageSize bounds one incoming JSON-RPC line. A single huge line must not
+// be able to exhaust memory: the rest of an oversized line is discarded and the
+// client gets an error instead.
+const maxMessageSize = 4 << 20
+
+// callTimeout bounds one tools/call invocation.
+const callTimeout = 30 * time.Second
+
+var errMessageTooLarge = errors.New("message exceeds maximum size")
 
 type request struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -47,56 +65,309 @@ type response struct {
 type Server struct {
 	store   *store.Store
 	version string
+	logger  *slog.Logger
+
+	mu          sync.Mutex
+	initialized bool
+	inflight    map[string]context.CancelFunc
 }
 
-// NewServer builds a server backed by st.
-func NewServer(st *store.Store, version string) *Server {
-	return &Server{store: st, version: version}
+// NewServer builds a server backed by st. A nil logger discards all logs.
+func NewServer(st *store.Store, version string, logger *slog.Logger) *Server {
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	return &Server{
+		store:    st,
+		version:  version,
+		logger:   logger,
+		inflight: make(map[string]context.CancelFunc),
+	}
 }
 
-// Serve reads newline-delimited JSON-RPC requests until EOF.
-func (s *Server) Serve(r io.Reader, w io.Writer) error {
-	decoder := json.NewDecoder(r)
+// Serve reads newline-delimited JSON-RPC messages until EOF or until ctx is
+// cancelled. Malformed messages are answered and do not stop the stream.
+func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reader := bufio.NewReaderSize(r, 64<<10)
 	encoder := json.NewEncoder(w)
 
-	for {
-		var req request
-		if err := decoder.Decode(&req); err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
+	var writeMu sync.Mutex
+	var errOnce sync.Once
+	var serveErr error
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+
+	recordErr := func(err error) {
+		errOnce.Do(func() { serveErr = err })
+		stop()
+	}
+	write := func(resp response) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		if err := encoder.Encode(resp); err != nil {
+			return fmt.Errorf("write response: %w", err)
+		}
+		return nil
+	}
+
+	// Closing a blocking reader (os.Stdin) lets a signal end the loop.
+	done := make(chan struct{})
+	defer close(done)
+	if closer, ok := r.(io.Closer); ok {
+		go func() {
+			select {
+			case <-runCtx.Done():
+				_ = closer.Close()
+			case <-done:
 			}
-			_ = encoder.Encode(response{
-				JSONRPC: "2.0",
-				Error:   &rpcError{Code: codeParseError, Message: "parse error: " + err.Error()},
-			})
-			return fmt.Errorf("decode request: %w", err)
+		}()
+	}
+
+	type callJob struct {
+		ctx    context.Context
+		req    request
+		cancel context.CancelFunc
+		key    string
+	}
+
+	var wg sync.WaitGroup
+	jobs := make(chan callJob)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// One worker preserves the order of tools/call requests, while the
+		// read loop stays free to deliver notifications/cancelled.
+		for job := range jobs {
+			resp, reply := s.handle(job.ctx, job.req)
+			if reply {
+				if err := write(resp); err != nil {
+					recordErr(err)
+				}
+			}
+			if job.key != "" {
+				s.clearInflight(job.key)
+			}
+			job.cancel()
+		}
+	}()
+	defer func() {
+		// Let requests that were already read finish before the session context
+		// is cancelled: EOF on stdin must not cancel a call in progress.
+		close(jobs)
+		wg.Wait()
+		stop()
+	}()
+
+	for {
+		if runCtx.Err() != nil {
+			return serveErr
+		}
+		line, err := readMessage(reader)
+		if errors.Is(err, errMessageTooLarge) {
+			s.logger.Warn("rejecting oversized message", "limit_bytes", maxMessageSize)
+			if writeErr := write(parseFailure(codeInvalidRequest,
+				fmt.Sprintf("request exceeds maximum size of %d bytes", maxMessageSize))); writeErr != nil {
+				recordErr(writeErr)
+				return serveErr
+			}
+			continue
+		}
+		if errors.Is(err, io.EOF) {
+			return serveErr
+		}
+		if err != nil {
+			if runCtx.Err() != nil {
+				return serveErr
+			}
+			recordErr(fmt.Errorf("read request: %w", err))
+			return serveErr
 		}
 
-		resp, reply := s.handle(req)
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+
+		var req request
+		if err := json.Unmarshal(line, &req); err != nil {
+			s.logger.Warn("parse error", "error", err)
+			if err := write(parseFailure(codeParseError, "parse error: "+err.Error())); err != nil {
+				recordErr(err)
+				return serveErr
+			}
+			continue
+		}
+		if req.JSONRPC != "2.0" {
+			s.logger.Warn("invalid request", "jsonrpc", req.JSONRPC)
+			if err := write(requestFailure(req, codeInvalidRequest, `invalid request: jsonrpc must be "2.0"`)); err != nil {
+				recordErr(err)
+				return serveErr
+			}
+			continue
+		}
+		if req.Method == "" {
+			if err := write(requestFailure(req, codeInvalidRequest, "invalid request: method is required")); err != nil {
+				recordErr(err)
+				return serveErr
+			}
+			continue
+		}
+
+		if req.Method == "notifications/cancelled" {
+			s.cancelRequest(req.Params)
+			continue
+		}
+
+		// tools/call can block on I/O, so it is handed to the worker: that is
+		// what makes notifications/cancelled able to reach a running call.
+		// Other methods are cheap and stay on the read loop.
+		if req.Method == "tools/call" {
+			key := idKey(req.ID)
+			callCtx, cancel := context.WithTimeout(runCtx, callTimeout)
+			if key != "" {
+				s.mu.Lock()
+				s.inflight[key] = cancel
+				s.mu.Unlock()
+			}
+			jobs <- callJob{ctx: callCtx, req: req, cancel: cancel, key: key}
+			continue
+		}
+
+		resp, reply := s.handle(runCtx, req)
 		if !reply {
 			continue
 		}
-		if err := encoder.Encode(resp); err != nil {
-			return fmt.Errorf("write response: %w", err)
+		if err := write(resp); err != nil {
+			recordErr(err)
+			return serveErr
 		}
 	}
 }
 
-func (s *Server) handle(req request) (response, bool) {
+// readMessage returns one line (without the trailing newline). It reads in
+// bounded chunks, so the memory used by a message is capped.
+func readMessage(r *bufio.Reader) ([]byte, error) {
+	var buf []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if len(buf)+len(chunk) > maxMessageSize {
+			if errors.Is(err, bufio.ErrBufferFull) {
+				if _, discardErr := discardLine(r); discardErr != nil && !errors.Is(discardErr, io.EOF) {
+					return nil, discardErr
+				}
+			}
+			return nil, errMessageTooLarge
+		}
+		buf = append(buf, chunk...)
+		switch {
+		case err == nil:
+			return buf, nil
+		case errors.Is(err, bufio.ErrBufferFull):
+			continue
+		case errors.Is(err, io.EOF):
+			if len(buf) == 0 {
+				return nil, io.EOF
+			}
+			return buf, nil
+		default:
+			return nil, err
+		}
+	}
+}
+
+// discardLine consumes the remainder of an oversized line.
+func discardLine(r *bufio.Reader) (int, error) {
+	discarded := 0
+	for {
+		chunk, err := r.ReadSlice('\n')
+		discarded += len(chunk)
+		if !errors.Is(err, bufio.ErrBufferFull) {
+			return discarded, err
+		}
+	}
+}
+
+func parseFailure(code int, message string) response {
+	return response{JSONRPC: "2.0", Error: &rpcError{Code: code, Message: message}}
+}
+
+func requestFailure(req request, code int, message string) response {
+	return response{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: code, Message: message}}
+}
+
+func idKey(id json.RawMessage) string {
+	if len(id) == 0 || string(id) == "null" {
+		return ""
+	}
+	return string(id)
+}
+
+func (s *Server) cancelRequest(raw json.RawMessage) {
+	var params struct {
+		RequestID json.RawMessage `json:"requestId"`
+		Reason    string          `json:"reason"`
+	}
+	if err := json.Unmarshal(raw, &params); err != nil {
+		s.logger.Warn("invalid cancellation", "error", err)
+		return
+	}
+	key := idKey(params.RequestID)
+	s.mu.Lock()
+	cancel, ok := s.inflight[key]
+	s.mu.Unlock()
+	if !ok {
+		s.logger.Debug("cancellation for unknown request", "request_id", key)
+		return
+	}
+	s.logger.Debug("cancelling request", "request_id", key, "reason", params.Reason)
+	cancel()
+}
+
+func (s *Server) clearInflight(key string) {
+	s.mu.Lock()
+	delete(s.inflight, key)
+	s.mu.Unlock()
+}
+
+func (s *Server) isInitialized() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.initialized
+}
+
+func (s *Server) markInitialized() {
+	s.mu.Lock()
+	s.initialized = true
+	s.mu.Unlock()
+}
+
+func (s *Server) handle(ctx context.Context, req request) (response, bool) {
 	hasID := len(req.ID) > 0 && string(req.ID) != "null"
 	resp := response{JSONRPC: "2.0", ID: req.ID}
 
 	switch req.Method {
 	case "initialize":
 		resp.Result = s.initialize(req.Params)
+		s.markInitialized()
 	case "notifications/initialized", "notifications/cancelled":
 		return response{}, false
 	case "ping":
 		resp.Result = struct{}{}
 	case "tools/list":
+		if !s.isInitialized() {
+			resp.Error = &rpcError{Code: codeServerNotInitialized, Message: "server not initialized: send initialize first"}
+			break
+		}
 		resp.Result = listToolsResult{Tools: toolDefinitions()}
 	case "tools/call":
-		result, rpcErr := s.callTool(req.Params)
+		if !s.isInitialized() {
+			resp.Error = &rpcError{Code: codeServerNotInitialized, Message: "server not initialized: send initialize first"}
+			break
+		}
+		result, rpcErr := s.callTool(ctx, req.Params)
 		if rpcErr != nil {
 			resp.Error = rpcErr
 		} else {
@@ -164,7 +435,7 @@ func negotiateVersion(requested string) string {
 }
 
 // callTool dispatches a tools/call payload.
-func (s *Server) callTool(raw json.RawMessage) (toolResult, *rpcError) {
+func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (toolResult, *rpcError) {
 	var params callToolParams
 	if err := decodeParams(raw, &params); err != nil {
 		return toolResult{}, &rpcError{Code: codeInvalidParams, Message: err.Error()}
@@ -173,9 +444,24 @@ func (s *Server) callTool(raw json.RawMessage) (toolResult, *rpcError) {
 	if !ok {
 		return toolResult{}, &rpcError{Code: codeInvalidParams, Message: fmt.Sprintf("unknown tool %q", params.Name)}
 	}
-	payload, err := handler(context.Background(), s.store, params.Arguments)
+	payload, err := handler(ctx, s.store, params.Arguments)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			message := "request cancelled"
+			if errors.Is(ctxErr, context.DeadlineExceeded) {
+				message = "request timed out"
+			}
+			s.logger.Warn("tool call interrupted", "tool", params.Name, "reason", message)
+			return toolResult{}, &rpcError{Code: codeRequestCancelled, Message: message}
+		}
+		var domain *store.Error
+		if errors.As(err, &domain) {
+			s.logger.Warn("tool call failed", "tool", params.Name, "code", domain.Code)
+		} else {
+			s.logger.Error("tool call failed", "tool", params.Name, "error", err)
+		}
 		return errorResult(err), nil
 	}
+	s.logger.Debug("tool call succeeded", "tool", params.Name)
 	return jsonResult(payload), nil
 }

@@ -10,9 +10,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
-	_ "modernc.org/sqlite"
+	_ "modernc.org/sqlite" // register the pure-Go sqlite driver
 )
 
 // Pagination bounds for List.
@@ -21,21 +23,46 @@ const (
 	MaxLimit     = 500
 )
 
-const schema = `
-CREATE TABLE IF NOT EXISTS tasks (
+// Field limits: one task must not be able to grow the database and every MCP
+// response without bound.
+const (
+	MaxNameBytes    = 1 << 10 // 1 KiB
+	MaxContentBytes = 1 << 20 // 1 MiB
+)
+
+// migration is one schema step. Versions are applied in order and recorded in
+// PRAGMA user_version, so a future column change is applied exactly once.
+type migration struct {
+	version    int
+	statements []string
+}
+
+var migrations = []migration{
+	{
+		version: 1,
+		statements: []string{
+			`CREATE TABLE IF NOT EXISTS tasks (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,
 	name       TEXT NOT NULL,
 	content    TEXT NOT NULL DEFAULT '',
 	status     TEXT NOT NULL DEFAULT 'create',
 	created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS tasks_status_id ON tasks (status, id);
-`
+)`,
+			`CREATE INDEX IF NOT EXISTS tasks_status_id ON tasks (status, id)`,
+		},
+	},
+}
+
+// SupportedSchemaVersion is the schema version this binary knows how to write.
+func SupportedSchemaVersion() int { return migrations[len(migrations)-1].version }
 
 // Store owns the SQLite database.
 type Store struct {
 	db   *sql.DB
 	path string
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // Open opens (and creates when missing) the database at path.
@@ -43,13 +70,18 @@ func Open(path string) (*Store, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("database path is empty")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := ensurePrivateDir(dir); err != nil {
 		return nil, fmt.Errorf("create data directory: %w", err)
 	}
 
 	u := url.URL{Scheme: "file", Path: path}
 	query := u.Query()
 	query.Add("_pragma", "busy_timeout(5000)")
+	// WAL keeps readers from blocking the writer; NORMAL is safe for a local
+	// single-user database and avoids an fsync on every commit.
+	query.Add("_pragma", "journal_mode(WAL)")
+	query.Add("_pragma", "synchronous(NORMAL)")
 	u.RawQuery = query.Encode()
 
 	db, err := sql.Open("sqlite", u.String())
@@ -63,41 +95,154 @@ func Open(path string) (*Store, error) {
 	db.SetMaxOpenConns(1)
 
 	if err := db.Ping(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("open database: %w", err)
 	}
-	// One transaction for the whole schema: a failure must not leave the table
-	// without its index.
-	tx, err := db.BeginTx(context.Background(), nil)
-	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("initialise schema: %w", err)
+	// The file is created with the process umask (usually 0644); task contents
+	// must not be readable by other local users.
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("restrict database permissions: %w", err)
 	}
-	if _, err := tx.Exec(schema); err != nil {
-		tx.Rollback()
-		db.Close()
-		return nil, fmt.Errorf("initialise schema: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("initialise schema: %w", err)
+	if err := migrate(context.Background(), db); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 	return &Store{db: db, path: path}, nil
+}
+
+// ensurePrivateDir creates dir (mode 0700) or tightens an existing one.
+func ensurePrivateDir(dir string) error {
+	info, err := os.Stat(dir)
+	switch {
+	case err == nil:
+		if !info.IsDir() {
+			return fmt.Errorf("%s is not a directory", dir)
+		}
+		if info.Mode().Perm()&0o077 == 0 {
+			return nil
+		}
+		return os.Chmod(dir, 0o700) //nolint:gosec // 0700 is deliberate for a private directory
+	case errors.Is(err, os.ErrNotExist):
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+		return os.Chmod(dir, 0o700) //nolint:gosec // 0700 is deliberate for a private directory
+	default:
+		return err
+	}
+}
+
+// migrate applies every pending schema version inside one transaction: on
+// failure the database keeps its previous version and no half-applied schema.
+func migrate(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("initialise schema: %w", err)
+	}
+	var version int
+	if err := tx.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("initialise schema: read version: %w", err)
+	}
+	if version > SupportedSchemaVersion() {
+		_ = tx.Rollback()
+		return fmt.Errorf("database schema version %d is newer than supported %d", version, SupportedSchemaVersion())
+	}
+	for _, m := range migrations {
+		if m.version <= version {
+			continue
+		}
+		for _, statement := range m.statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("initialise schema: migration %d: %w", m.version, err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, m.version)); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("initialise schema: migration %d: %w", m.version, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("initialise schema: %w", err)
+	}
+	return nil
 }
 
 // Path returns the database file path.
 func (s *Store) Path() string { return s.path }
 
-// Close releases the database.
-func (s *Store) Close() error { return s.db.Close() }
+// SchemaVersion reports the PRAGMA user_version of the open database.
+func (s *Store) SchemaVersion(ctx context.Context) (int, error) {
+	var version int
+	if err := s.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		return 0, fmt.Errorf("read schema version: %w", err)
+	}
+	return version, nil
+}
+
+// JournalMode reports the active SQLite journal mode (wal, delete, …).
+func (s *Store) JournalMode(ctx context.Context) (string, error) {
+	var mode string
+	if err := s.db.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&mode); err != nil {
+		return "", fmt.Errorf("read journal mode: %w", err)
+	}
+	return mode, nil
+}
+
+// CheckWritable proves that the database accepts a write transaction.
+func (s *Store) CheckWritable(ctx context.Context) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("begin write transaction: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+		return fmt.Errorf("rollback write transaction: %w", err)
+	}
+	return nil
+}
+
+// QuickCheck runs SQLite's integrity check and returns its result ("ok").
+func (s *Store) QuickCheck(ctx context.Context) (string, error) {
+	var result string
+	if err := s.db.QueryRowContext(ctx, `PRAGMA quick_check`).Scan(&result); err != nil {
+		return "", fmt.Errorf("integrity check: %w", err)
+	}
+	return result, nil
+}
+
+// Close checkpoints the WAL and releases the database. It is safe to call more
+// than once.
+func (s *Store) Close() error {
+	s.closeOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			s.closeErr = fmt.Errorf("checkpoint database: %w", err)
+		}
+		if err := s.db.Close(); err != nil && s.closeErr == nil {
+			s.closeErr = fmt.Errorf("close database: %w", err)
+		}
+	})
+	return s.closeErr
+}
 
 // Add creates a task in status create.
 func (s *Store) Add(ctx context.Context, name string, content *string) (Task, error) {
-	if strings.TrimSpace(name) == "" {
-		return Task{}, invalidArgumentf("name must not be empty")
+	name, err := validateName(name)
+	if err != nil {
+		return Task{}, err
 	}
 	body := ""
 	if content != nil {
+		if err := validateContent(*content); err != nil {
+			return Task{}, err
+		}
 		body = *content
 	}
 	createdAt := time.Now().UTC().Truncate(time.Second)
@@ -119,6 +264,32 @@ func (s *Store) Add(ctx context.Context, name string, content *string) (Task, er
 		Status:    StatusCreate,
 		CreatedAt: createdAt,
 	}, nil
+}
+
+// validateName trims the name, rejects blank and oversized values.
+func validateName(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", invalidArgumentf("name must not be empty")
+	}
+	if !utf8.ValidString(name) {
+		return "", invalidArgumentf("name must be valid UTF-8")
+	}
+	if len(name) > MaxNameBytes {
+		return "", invalidArgumentf("name must be at most %d bytes", MaxNameBytes)
+	}
+	return name, nil
+}
+
+// validateContent keeps content as sent, but bounds its size.
+func validateContent(content string) error {
+	if !utf8.ValidString(content) {
+		return invalidArgumentf("content must be valid UTF-8")
+	}
+	if len(content) > MaxContentBytes {
+		return invalidArgumentf("content must be at most %d bytes", MaxContentBytes)
+	}
+	return nil
 }
 
 // Get returns one task by id.
@@ -192,7 +363,7 @@ func (s *Store) List(ctx context.Context, filter ListFilter) (Page, error) {
 	if err != nil {
 		return Page{}, fmt.Errorf("list tasks: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	tasks := make([]Task, 0, limit)
 	for rows.Next() {
@@ -228,8 +399,17 @@ func (s *Store) Update(ctx context.Context, id int64, patch Patch) (Task, error)
 	if patch.Name == nil && patch.Content == nil && patch.Status == nil {
 		return Task{}, invalidArgumentf("at least one of name, content or status is required")
 	}
-	if patch.Name != nil && strings.TrimSpace(*patch.Name) == "" {
-		return Task{}, invalidArgumentf("name must not be empty")
+	if patch.Name != nil {
+		name, err := validateName(*patch.Name)
+		if err != nil {
+			return Task{}, err
+		}
+		patch.Name = &name
+	}
+	if patch.Content != nil {
+		if err := validateContent(*patch.Content); err != nil {
+			return Task{}, err
+		}
 	}
 	if patch.Status != nil && !patch.Status.Valid() {
 		return Task{}, invalidArgumentf("unknown status %q", *patch.Status)
@@ -264,8 +444,9 @@ func (s *Store) Update(ctx context.Context, id int64, patch Patch) (Task, error)
 		// the version that was read. Inside this transaction it cannot fire — it
 		// is the safety net for a writer that bypasses withWriteTx.
 		args = append(args, id, string(current.Status))
+		// Column names come from the fixed list above; values stay parameterised.
 		result, err := conn.ExecContext(ctx,
-			`UPDATE tasks SET `+strings.Join(sets, ", ")+` WHERE id = ? AND status = ?`, args...)
+			`UPDATE tasks SET `+strings.Join(sets, ", ")+` WHERE id = ? AND status = ?`, args...) //nolint:gosec // SQL is assembled from constant column names only
 		if err != nil {
 			return fmt.Errorf("update task: %w", err)
 		}
@@ -297,7 +478,7 @@ func (s *Store) withWriteTx(ctx context.Context, fn func(conn *sql.Conn) error) 
 	if err != nil {
 		return fmt.Errorf("acquire connection: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
@@ -325,18 +506,20 @@ func (s *Store) rollback(ctx context.Context, conn *sql.Conn) {
 type Stats struct {
 	Total    int            `json:"total"`
 	ByStatus map[Status]int `json:"by_status"`
+	Unknown  int            `json:"unknown"`
 }
 
-// Stats counts tasks by status.
+// Stats counts tasks by status. A status that is not in the current schema is
+// counted in Unknown instead of silently entering ByStatus.
 func (s *Store) Stats(ctx context.Context) (Stats, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM tasks GROUP BY status`)
 	if err != nil {
 		return Stats{}, fmt.Errorf("count tasks: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
-	stats := Stats{ByStatus: make(map[Status]int, len(Statuses))}
-	for _, status := range Statuses {
+	stats := Stats{ByStatus: make(map[Status]int, len(statuses()))}
+	for _, status := range statuses() {
 		stats.ByStatus[status] = 0
 	}
 	for rows.Next() {
@@ -345,8 +528,12 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 		if err := rows.Scan(&status, &count); err != nil {
 			return Stats{}, fmt.Errorf("count tasks: %w", err)
 		}
-		stats.ByStatus[status] = count
 		stats.Total += count
+		if !status.Valid() {
+			stats.Unknown += count
+			continue
+		}
+		stats.ByStatus[status] = count
 	}
 	if err := rows.Err(); err != nil {
 		return Stats{}, fmt.Errorf("count tasks: %w", err)
