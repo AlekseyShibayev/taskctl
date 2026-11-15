@@ -42,4 +42,4 @@ tools:                    # по одному на вызов; * = необяз�
 git clone https://github.com/AlekseyShibayev/taskctl.git && cd taskctl && make install
 ```
 
-Подключение к MCP-клиенту: имя `taskctl`, команда `taskctl`, аргументы `mcp`, транспорт stdio. `make test` проверяет переходы и форматы ответов. Целевая система — Linux; секреты в задачах не размещаются.
+Подключение к MCP-клиенту: имя `taskctl`, команда `taskctl`, аргументы `mcp`, транспорт stdio. `make test` проверяет переходы и форматы ответов. Целевая система — Linux.
