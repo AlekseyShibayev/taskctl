@@ -70,6 +70,13 @@ func Open(path string) (*Store, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("database path is empty")
 	}
+	// The SQLite DSN is a file: URI, which needs an absolute path; a relative
+	// XDG_DATA_HOME or "./tasks.db" used to produce "invalid uri authority".
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve database path: %w", err)
+	}
+	path = absolute
 	dir := filepath.Dir(path)
 	if err := ensurePrivateDir(dir); err != nil {
 		return nil, fmt.Errorf("create data directory: %w", err)

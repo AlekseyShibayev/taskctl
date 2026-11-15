@@ -162,6 +162,7 @@ rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/taskctl"
 | Client sees no tools | stdio transport, argument `mcp`, `initialize` first, a supported protocol version. |
 | `taskctl: database is locked` | Another process holds the write lock longer than `busy_timeout` (5 s). Close extra MCP sessions. |
 | `taskctl: ... permission denied` | The data directory must belong to the user and be `0700`; run `taskctl doctor`. |
+| `doctor` reports `FAIL permissions` | The directory predates the current version and is group/world accessible: `chmod 700 "${XDG_DATA_HOME:-$HOME/.local/share}/taskctl"`. `Open` deliberately does not change permissions of an existing parent. |
 | Client fails to parse responses | Something else writes to stdout (for example an `echo` in a wrapper). stdout is JSON-RPC only; logs go to stderr. |
 | `version: dev` | The binary was built without a tag. Use a release artifact or build from a tagged checkout (`git describe`). |
 | `tasks.db-wal`/`-shm` remain after a crash | Normal for WAL; SQLite recovers on the next open and `Close` checkpoints. |

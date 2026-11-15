@@ -271,6 +271,12 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 		// Other methods are cheap and stay on the read loop.
 		if req.Method == "tools/call" {
 			key := idKey(req.ID)
+			if key == "" {
+				// Without an id this is a notification: never run a side effect
+				// that could not be reported. It is not a request, so no reply.
+				s.logger.Warn("ignoring tools/call without id")
+				continue
+			}
 			timeout := s.callTimeout
 			if timeout <= 0 {
 				timeout = defaultCallTimeout
@@ -426,6 +432,9 @@ func (s *Server) handle(ctx context.Context, req request) (response, bool) {
 		}
 		resp.Result = listToolsResult{Tools: toolDefinitions()}
 	case "tools/call":
+		if !hasID {
+			return response{}, false
+		}
 		if !s.isInitialized() {
 			resp.Error = &rpcError{Code: codeServerNotInitialized, Message: "server not initialized: send initialize first"}
 			break

@@ -67,7 +67,7 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 	}
 }
 
-func runMCP(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) int {
+func runMCP(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 	st, err := openStore()
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "taskctl: %v\n", err)
@@ -76,6 +76,9 @@ func runMCP(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) int 
 	defer func() {
 		if err := st.Close(); err != nil {
 			_, _ = fmt.Fprintf(stderr, "taskctl: %v\n", err)
+			if code == 0 {
+				code = 1
+			}
 		}
 	}()
 

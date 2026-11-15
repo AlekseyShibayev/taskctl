@@ -690,3 +690,23 @@ func TestServeStopsWhenContextCanceled(t *testing.T) {
 		t.Fatal("Serve did not stop after cancellation")
 	}
 }
+
+func TestToolsCallRequiresID(t *testing.T) {
+	st := newStore(t)
+	envelopes := runServerRaw(t, st,
+		encodeRequest(1, "initialize", map[string]any{"protocolVersion": "2025-06-18"}),
+		`{"jsonrpc":"2.0","method":"tools/call","params":{"name":"add","arguments":{"name":"silent"}}}`,
+		encodeRequest(2, "tools/call", map[string]any{"name": "list", "arguments": map[string]any{}}),
+	)
+	if len(envelopes) != 2 {
+		t.Fatalf("responses = %d, want 2 (a notification gets no reply)", len(envelopes))
+	}
+	page, isError := toolPayload(t, envelopes[1])
+	if isError {
+		t.Fatalf("list failed: %v", page)
+	}
+	tasks, _ := page["tasks"].([]any)
+	if len(tasks) != 0 {
+		t.Fatalf("a tools/call without id was executed: %v", tasks)
+	}
+}

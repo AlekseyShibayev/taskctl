@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -131,4 +133,74 @@ func TestCallTimeout(t *testing.T) {
 		}
 	}
 	t.Fatalf("no response for the timed-out call: %q", out.String())
+}
+
+// The queue must never block the read loop. One blocked call plus a full buffer
+// makes the next call fail fast with -32603, while a cancellation is still read.
+func TestQueueOverflowAnswersInternalError(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	var calls atomic.Int64
+	toolHandlers["hang"] = func(ctx context.Context, _ *store.Store, _ json.RawMessage) (any, error) {
+		if calls.Add(1) == 1 {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return "ok", nil
+	}
+	t.Cleanup(func() { delete(toolHandlers, "hang") })
+
+	server := NewServer(st, "test", nil)
+	server.callTimeout = 200 * time.Millisecond
+
+	lines := []string{`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}`}
+	const callsToSend = 258 // one running + 256 buffered + one rejected
+	for id := 2; id < 2+callsToSend; id++ {
+		lines = append(lines, fmt.Sprintf(
+			`{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"hang","arguments":{}}}`, id))
+	}
+	lines = append(lines,
+		`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}`,
+		`{"jsonrpc":"2.0","id":1000,"method":"ping"}`,
+	)
+
+	var out bytes.Buffer
+	if err := server.Serve(context.Background(), strings.NewReader(strings.Join(lines, "\n")+"\n"), &out); err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+
+	busy := 0
+	cancelled := false
+	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		var envelope struct {
+			ID    int `json:"id"`
+			Error *struct {
+				Code int `json:"code"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(line), &envelope); err != nil {
+			t.Fatalf("decode %q: %v", line, err)
+		}
+		if envelope.Error == nil {
+			continue
+		}
+		switch envelope.Error.Code {
+		case codeInternalError:
+			busy++
+		case codeRequestCancelled:
+			if envelope.ID == 2 {
+				cancelled = true
+			}
+		}
+	}
+	if busy != 1 {
+		t.Errorf("busy responses = %d, want 1", busy)
+	}
+	if !cancelled {
+		t.Error("the running call was not cancelled")
+	}
 }

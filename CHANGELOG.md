@@ -48,6 +48,12 @@ First tagged release.
   reports a loose directory instead of silently fixing it.
 - `CheckWritable` rolls back with a context that cannot be cancelled and drops
   a connection that still holds a transaction.
+- Relative database paths (and a relative `XDG_DATA_HOME`) work again: the
+  SQLite DSN is built from an absolute path.
+- A `tools/call` without an `id` is ignored and logged instead of executing a
+  side effect that cannot be reported.
+- Tool schemas no longer advertise a `maxLength` in characters while the server
+  enforces a byte limit; the descriptions state the 1 KiB/1 MiB limits.
 - `name` and `content` are bounded (1 KiB / 1 MiB), validated as UTF-8 and the
   stored name is trimmed.
 

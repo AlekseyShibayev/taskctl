@@ -790,3 +790,28 @@ func TestOpenRejectsNewerSchema(t *testing.T) {
 		t.Fatalf("open = %v, want a newer-schema error", err)
 	}
 }
+
+func TestOpenRelativePath(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Chdir(dir)
+
+	st, err := store.Open("tasks.db")
+	if err != nil {
+		t.Fatalf("open relative path: %v", err)
+	}
+	defer st.Close()
+
+	if want := filepath.Join(dir, "tasks.db"); st.Path() != want {
+		t.Errorf("path = %q, want %q", st.Path(), want)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o755 {
+		t.Errorf("current directory mode = %04o, want 0755 (unchanged)", mode)
+	}
+}

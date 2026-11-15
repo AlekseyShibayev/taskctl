@@ -74,14 +74,12 @@ func toolDefinitions() []toolDefinition {
 				"properties": map[string]any{
 					"name": map[string]any{
 						"type":        "string",
-						"description": "Task name, must not be empty.",
+						"description": "Task name, must not be empty (at most 1 KiB of UTF-8).",
 						"minLength":   1,
-						"maxLength":   store.MaxNameBytes,
 					},
 					"content": map[string]any{
 						"type":        "string",
-						"description": "Task description.",
-						"maxLength":   store.MaxContentBytes,
+						"description": "Task description (at most 1 MiB of UTF-8).",
 					},
 				},
 				"required":             []string{"name"},
@@ -135,8 +133,8 @@ func toolDefinitions() []toolDefinition {
 				"type": "object",
 				"properties": map[string]any{
 					"id":      map[string]any{"type": "integer", "minimum": 1},
-					"name":    map[string]any{"type": "string", "minLength": 1, "maxLength": store.MaxNameBytes},
-					"content": map[string]any{"type": "string", "maxLength": store.MaxContentBytes},
+					"name":    map[string]any{"type": "string", "minLength": 1, "description": "Task name (at most 1 KiB of UTF-8)."},
+					"content": map[string]any{"type": "string", "description": "Task description (at most 1 MiB of UTF-8)."},
 					"status":  map[string]any{"type": "string", "enum": statusEnum()},
 				},
 				"required":             []string{"id"},
