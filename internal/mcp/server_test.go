@@ -144,6 +144,26 @@ func requireToolError(t *testing.T, envelope rpcEnvelope) {
 	}
 }
 
+func toolErrorText(t *testing.T, envelope rpcEnvelope) string {
+	t.Helper()
+	var result struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+		IsError bool `json:"isError"`
+	}
+	if err := json.Unmarshal(envelope.Result, &result); err != nil {
+		t.Fatalf("decode tool result: %v (%s)", err, envelope.Result)
+	}
+	if !result.IsError {
+		t.Fatalf("expected isError, got %s", envelope.Result)
+	}
+	if len(result.Content) == 0 || result.Content[0].Text == "" {
+		t.Fatalf("error has no message: %s", envelope.Result)
+	}
+	return result.Content[0].Text
+}
+
 func TestInitialize(t *testing.T) {
 	st := newStore(t)
 	for _, requested := range []string{"2024-11-05", "2025-03-26", "1999-01-01"} {
@@ -254,6 +274,30 @@ func TestListPaginationAndBounds(t *testing.T) {
 	)
 	for _, envelope := range bad {
 		requireToolError(t, envelope)
+	}
+}
+
+// TestSliceErrorMessages pins what the client reads: the allowed range with the
+// offending value, and the enum for an unknown status.
+func TestSliceErrorMessages(t *testing.T) {
+	st := newStore(t)
+	envelopes := runServer(t, st,
+		encodeTool(1, "slice", map[string]any{"limit": 51}),
+		encodeTool(2, "slice", map[string]any{"status": "nope"}),
+	)
+	want := []string{
+		"limit must be between 1 and 50, got 51",
+		`unknown status "nope": expected one of [create in_progress done]`,
+	}
+	for i, envelope := range envelopes {
+		if got := toolErrorText(t, envelope); got != want[i] {
+			t.Errorf("error %d = %q, want %q", i, got, want[i])
+		}
+	}
+
+	listed := runServer(t, st, encodeTool(1, "slice", map[string]any{"limit": 50}))
+	if payload, isError := toolPayload(t, listed[0]); isError || payload["limit"] != float64(50) {
+		t.Fatalf("limit 50 = %v (isError=%v)", payload, isError)
 	}
 }
 

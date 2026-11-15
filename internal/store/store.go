@@ -17,10 +17,11 @@ import (
 	_ "modernc.org/sqlite" // register the pure-Go sqlite driver
 )
 
-// Pagination bounds for List.
+// Pagination bounds for List: one page holds the default number of tasks unless
+// the caller asks for fewer.
 const (
 	DefaultLimit = 50
-	MaxLimit     = 500
+	MaxLimit     = 50
 )
 
 // Field limits: one task must not be able to grow the database and every MCP
@@ -260,13 +261,15 @@ func (s *Store) List(ctx context.Context, filter ListFilter) (Page, error) {
 		limit = DefaultLimit
 	}
 	if limit < 1 || limit > MaxLimit {
-		return Page{}, fmt.Errorf("limit must be between 1 and %d", MaxLimit)
+		return Page{}, fmt.Errorf("limit must be between 1 and %d, got %d", MaxLimit, limit)
 	}
 	if filter.Offset < 0 {
-		return Page{}, fmt.Errorf("offset must not be negative")
+		return Page{}, fmt.Errorf("offset must not be negative, got %d", filter.Offset)
 	}
-	if filter.Status != nil && !filter.Status.Valid() {
-		return Page{}, fmt.Errorf("unknown status %q", *filter.Status)
+	if filter.Status != nil {
+		if _, err := ParseStatus(string(*filter.Status)); err != nil {
+			return Page{}, err
+		}
 	}
 
 	query := `SELECT id, name, content, status, created_at FROM tasks`

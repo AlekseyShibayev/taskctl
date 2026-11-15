@@ -213,6 +213,27 @@ func TestListFilterAndBounds(t *testing.T) {
 	}
 }
 
+// TestListErrorMessages pins the wording clients see: the allowed range plus
+// the offending value for limit, and the full enum for an unknown status.
+func TestListErrorMessages(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	if _, err := st.List(ctx, store.ListFilter{Limit: store.MaxLimit}); err != nil {
+		t.Fatalf("limit at the maximum must be accepted: %v", err)
+	}
+	_, err := st.List(ctx, store.ListFilter{Limit: store.MaxLimit + 1})
+	if want := "limit must be between 1 and 50, got 51"; err == nil || err.Error() != want {
+		t.Fatalf("limit 51 error = %v, want %q", err, want)
+	}
+
+	invalid := store.Status("nope")
+	_, err = st.List(ctx, store.ListFilter{Status: &invalid})
+	if want := `unknown status "nope": expected one of [create in_progress done]`; err == nil || err.Error() != want {
+		t.Fatalf("unknown status error = %v, want %q", err, want)
+	}
+}
+
 func TestUpdateFields(t *testing.T) {
 	st := newStore(t)
 	task := mustAdd(t, st, "old")

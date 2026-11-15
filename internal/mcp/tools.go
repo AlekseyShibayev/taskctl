@@ -157,13 +157,13 @@ func sliceTool(ctx context.Context, st *store.Store, raw json.RawMessage) (any, 
 	}
 	if args.Limit != nil {
 		if *args.Limit < 1 || *args.Limit > store.MaxLimit {
-			return nil, fmt.Errorf("limit must be between 1 and %d", store.MaxLimit)
+			return nil, fmt.Errorf("limit must be between 1 and %d, got %d", store.MaxLimit, *args.Limit)
 		}
 		filter.Limit = *args.Limit
 	}
 	if args.Offset != nil {
 		if *args.Offset < 0 {
-			return nil, fmt.Errorf("offset must not be negative")
+			return nil, fmt.Errorf("offset must not be negative, got %d", *args.Offset)
 		}
 		filter.Offset = *args.Offset
 	}
