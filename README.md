@@ -20,7 +20,7 @@ make install                      # ~/.local/bin/taskctl
 
 | Инструмент | Аргументы |
 | --- | --- |
-| `create` | `name`, `content*` |
+| `create` | `name`, `content` |
 | `slice` | `status*`, `limit*`, `offset*` |
 | `get` | `id` |
 | `update` | `id`, `name*`, `content*`, `status*` |

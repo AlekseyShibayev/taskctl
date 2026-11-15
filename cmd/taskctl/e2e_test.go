@@ -94,7 +94,7 @@ func TestStdioSmoke(t *testing.T) {
 	}
 
 	added := toolPayload(request(3, "tools/call", map[string]any{
-		"name": "create", "arguments": map[string]any{"name": "smoke task"},
+		"name": "create", "arguments": map[string]any{"name": "smoke task", "content": "via stdio"},
 	}))
 	if added["id"] != float64(1) || added["status"] != "create" {
 		t.Fatalf("add = %v", added)

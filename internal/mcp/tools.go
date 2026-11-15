@@ -47,7 +47,7 @@ func toolDefinitions() []toolDefinition {
 	return []toolDefinition{
 		{
 			Name:        "create",
-			Description: "Create a task. A new task starts in status create; name is required, content is optional.",
+			Description: "Create a task. A new task starts in status create; name and content are required.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -61,7 +61,7 @@ func toolDefinitions() []toolDefinition {
 						"description": "Task description (at most 1 MiB of UTF-8).",
 					},
 				},
-				"required":             []string{"name"},
+				"required":             []string{"name", "content"},
 				"additionalProperties": false,
 			},
 		},
@@ -130,6 +130,9 @@ func createTool(ctx context.Context, st *store.Store, raw json.RawMessage) (any,
 	}
 	if args.Name == nil {
 		return nil, requiredArgumentf("name")
+	}
+	if args.Content == nil {
+		return nil, requiredArgumentf("content")
 	}
 	return st.Add(ctx, *args.Name, args.Content)
 }

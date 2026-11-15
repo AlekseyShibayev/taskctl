@@ -239,7 +239,7 @@ func TestAddShowListUpdate(t *testing.T) {
 func TestListPaginationAndBounds(t *testing.T) {
 	st := newStore(t)
 	for i := 1; i <= 3; i++ {
-		runServer(t, st, encodeTool(i, "create", map[string]any{"name": "task"}))
+		runServer(t, st, encodeTool(i, "create", map[string]any{"name": "task", "content": "details"}))
 	}
 	listed := runServer(t, st, encodeTool(1, "slice", map[string]any{"limit": 2, "offset": 0}))
 	payload, _ := toolPayload(t, listed[0])
@@ -259,7 +259,7 @@ func TestListPaginationAndBounds(t *testing.T) {
 
 func TestUpdateTransitions(t *testing.T) {
 	st := newStore(t)
-	runServer(t, st, encodeTool(1, "create", map[string]any{"name": "task"}))
+	runServer(t, st, encodeTool(1, "create", map[string]any{"name": "task", "content": "details"}))
 
 	invalid := runServer(t, st, encodeTool(1, "update", map[string]any{"id": 1, "status": "done"}))
 	requireToolError(t, invalid[0])
@@ -282,9 +282,10 @@ func TestArgumentAndDispatchErrors(t *testing.T) {
 	envelopes := runServer(t, st,
 		encodeRequest(1, "tools/call", map[string]any{"name": "nope"}),
 		encodeTool(2, "create", map[string]any{}),
+		encodeTool(7, "create", map[string]any{"name": "no content"}),
 		encodeTool(3, "get", map[string]any{}),
 		encodeTool(4, "get", map[string]any{"id": 42}),
-		encodeTool(5, "create", map[string]any{"name": "x", "extra": 1}),
+		encodeTool(5, "create", map[string]any{"name": "x", "content": "y", "extra": 1}),
 		encodeTool(6, "update", map[string]any{"id": 1}),
 	)
 	if envelopes[0].Error == nil || envelopes[0].Error.Code != -32602 {
@@ -295,6 +296,7 @@ func TestArgumentAndDispatchErrors(t *testing.T) {
 	requireToolError(t, envelopes[3])
 	requireToolError(t, envelopes[4])
 	requireToolError(t, envelopes[5])
+	requireToolError(t, envelopes[6])
 }
 
 func TestParseErrorDoesNotStopServer(t *testing.T) {
@@ -335,7 +337,7 @@ func TestInitializeRequired(t *testing.T) {
 	st := newStore(t)
 	envelopes := runServerRaw(t, st,
 		encodeRequest(1, "tools/list", nil),
-		encodeTool(2, "create", map[string]any{"name": "task"}),
+		encodeTool(2, "create", map[string]any{"name": "task", "content": "details"}),
 	)
 	for _, envelope := range envelopes {
 		if envelope.Error == nil || envelope.Error.Code != -32002 {
@@ -385,7 +387,7 @@ func TestToolsCallWithoutIDHasNoEffect(t *testing.T) {
 	st := newStore(t)
 	envelopes := runServerRaw(t, st,
 		encodeRequest(1, "initialize", map[string]any{}),
-		encodeRequest(nil, "tools/call", map[string]any{"name": "create", "arguments": map[string]any{"name": "task"}}),
+		encodeRequest(nil, "tools/call", map[string]any{"name": "create", "arguments": map[string]any{"name": "task", "content": "details"}}),
 		encodeTool(2, "slice", nil),
 	)
 	// The id-less call is a notification: no response and no task.
