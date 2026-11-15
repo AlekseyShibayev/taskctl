@@ -431,3 +431,34 @@ func TestEmptyInput(t *testing.T) {
 		t.Errorf("output = %q", out.String())
 	}
 }
+
+// The public API must not let a done task change either: name, content and any
+// status move are rejected, and the stored record stays as it was.
+func TestUpdateDoneIsRejected(t *testing.T) {
+	st := newStore(t)
+	runServer(t, st, encodeTool(1, "create", map[string]any{"name": "task", "content": "body"}))
+	runServer(t, st,
+		encodeTool(1, "update", map[string]any{"id": 1, "status": "in_progress"}),
+		encodeTool(2, "update", map[string]any{"id": 1, "status": "done"}),
+	)
+
+	for _, args := range []map[string]any{
+		{"id": 1, "name": "renamed"},
+		{"id": 1, "content": "rewritten"},
+		{"id": 1, "name": "renamed", "content": "rewritten"},
+		{"id": 1, "status": "create"},
+		{"id": 1, "status": "in_progress"},
+		{"id": 1, "name": "renamed", "status": "create"},
+		{"id": 1, "content": "rewritten", "status": "in_progress"},
+		{"id": 1, "name": "renamed", "content": "rewritten", "status": "create"},
+	} {
+		envelopes := runServer(t, st, encodeTool(1, "update", args))
+		requireToolError(t, envelopes[0])
+	}
+
+	current := runServer(t, st, encodeTool(1, "get", map[string]any{"id": 1}))
+	payload, _ := toolPayload(t, current[0])
+	if payload["name"] != "task" || payload["content"] != "body" || payload["status"] != "done" {
+		t.Fatalf("done task changed: %v", payload)
+	}
+}

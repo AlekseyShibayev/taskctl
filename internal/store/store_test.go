@@ -565,3 +565,70 @@ func TestOpenRelativePath(t *testing.T) {
 		t.Errorf("current directory mode = %04o, want 0755 (unchanged)", mode)
 	}
 }
+
+// A done task is a closed record: no field may change, and only the no-op
+// repetition of its status is accepted.
+func TestUpdateDoneIsImmutable(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	task := mustAdd(t, st, "closed")
+	for _, next := range []store.Status{store.StatusInProgress, store.StatusDone} {
+		status := next
+		updated, err := st.Update(ctx, task.ID, store.Patch{Status: &status})
+		if err != nil {
+			t.Fatalf("move to %s: %v", next, err)
+		}
+		task = updated
+	}
+
+	name := "renamed"
+	content := "rewritten"
+	create := store.StatusCreate
+	progress := store.StatusInProgress
+	done := store.StatusDone
+
+	cases := []struct {
+		name  string
+		patch store.Patch
+	}{
+		{"name", store.Patch{Name: &name}},
+		{"content", store.Patch{Content: &content}},
+		{"name_content", store.Patch{Name: &name, Content: &content}},
+		{"status_create", store.Patch{Status: &create}},
+		{"status_in_progress", store.Patch{Status: &progress}},
+		{"name_status_create", store.Patch{Name: &name, Status: &create}},
+		{"name_status_in_progress", store.Patch{Name: &name, Status: &progress}},
+		{"name_status_done", store.Patch{Name: &name, Status: &done}},
+		{"content_status_create", store.Patch{Content: &content, Status: &create}},
+		{"content_status_in_progress", store.Patch{Content: &content, Status: &progress}},
+		{"content_status_done", store.Patch{Content: &content, Status: &done}},
+		{"name_content_status_create", store.Patch{Name: &name, Content: &content, Status: &create}},
+		{"name_content_status_in_progress", store.Patch{Name: &name, Content: &content, Status: &progress}},
+		{"name_content_status_done", store.Patch{Name: &name, Content: &content, Status: &done}},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := st.Update(ctx, task.ID, tc.patch); err == nil {
+				t.Fatalf("update combined with %s succeeded on a done task", tc.name)
+			}
+			current, err := st.Get(ctx, task.ID)
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			if current.Name != task.Name || current.Content != task.Content || current.Status != done {
+				t.Fatalf("done task changed: %+v, want %+v", current, task)
+			}
+		})
+	}
+
+	// Repeating the terminal status is a no-op, not a change.
+	updated, err := st.Update(ctx, task.ID, store.Patch{Status: &done})
+	if err != nil {
+		t.Fatalf("repeat done status: %v", err)
+	}
+	if updated.Name != task.Name || updated.Content != task.Content || updated.Status != done {
+		t.Fatalf("no-op update changed the task: %+v", updated)
+	}
+}

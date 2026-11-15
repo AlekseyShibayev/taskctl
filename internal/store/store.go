@@ -340,6 +340,12 @@ func (s *Store) Update(ctx context.Context, id int64, patch Patch) (Task, error)
 		if err != nil {
 			return err
 		}
+		// A done task is a closed record: its text must not change. Repeating
+		// its status is allowed and changes nothing, everything else is rejected
+		// by the transition check below.
+		if current.Status == StatusDone && (patch.Name != nil || patch.Content != nil) {
+			return fmt.Errorf("task %d is done and cannot be changed", id)
+		}
 
 		sets := make([]string, 0, 3)
 		args := make([]any, 0, 5)
