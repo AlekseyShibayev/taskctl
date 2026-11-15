@@ -14,7 +14,7 @@ make install                      # ~/.local/bin/taskctl
 База — `~/.local/share/taskctl/tasks.db` (или `$XDG_DATA_HOME/taskctl/tasks.db`),
 создаётся при первой сессии.
 
-В MCP-клиенте: команда `taskctl`, аргумент `mcp`, транспорт stdio.
+MCP-клиент: `taskctl mcp`, stdio.
 
 ## MCP-инструменты
 
@@ -25,8 +25,8 @@ make install                      # ~/.local/bin/taskctl
 | `get` | `id` |
 | `update` | `id`, `status` |
 
-Переходы статусов: `create → in_progress → done`, назад `in_progress → create`
-(на доработку). `done` — терминальный. Задачи не удаляются.
+Переходы статусов: `create → in_progress → done`, назад `in_progress → create`.
+`done` — терминальный. Задачи не удаляются.
 
 ## Схема данных
 
