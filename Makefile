@@ -1,6 +1,6 @@
 GO ?= go
 BIN_DIR ?= $(HOME)/.local/bin
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+VERSION ?= $(shell (git describe --tags --always --dirty 2>/dev/null || echo dev) | sed 's/^v//')
 LDFLAGS := -s -w -X main.version=$(VERSION)
 COVERAGE_MIN ?= 70
 
