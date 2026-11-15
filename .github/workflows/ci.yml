@@ -20,19 +20,21 @@ jobs:
           cache: true
 
       - name: Format
-        run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "gofmt needed:"
-            echo "$unformatted"
-            exit 1
-          fi
+        run: make fmt-check
+
+      - name: Tidy
+        run: make tidy-check
 
       - name: Vet
-        run: go vet ./...
+        run: make vet
 
-      - name: Test
-        run: go test -race -cover ./...
+      - name: Lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.15.0
+
+      - name: Test and coverage
+        run: make cover-check
 
       - name: Build
         run: go build -trimpath ./...

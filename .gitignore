@@ -1,6 +1,9 @@
 /bin/
+/dist/
+/dist-*/
 .idea/
 .ai/
+coverage.out
 *.db
 *.db-journal
 *.db-wal
