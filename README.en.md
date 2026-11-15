@@ -13,7 +13,7 @@ A local task tracker: MCP over stdio backed by SQLite on your machine, with no n
 
 The tracker is the agent's working memory: tasks are created and updated from an MCP session, while the human only states what needs to be done.
 
-![A real taskctl session](assets/session.svg)
+![A real taskctl session](assets/session.png)
 
 ## Design decisions
 
