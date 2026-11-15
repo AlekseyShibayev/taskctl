@@ -731,7 +731,7 @@ func TestUpdateAcrossTwoStores(t *testing.T) {
 	}
 }
 
-func TestOpenTightensLoosePermissions(t *testing.T) {
+func TestOpenTightensFileButLeavesExistingDirectory(t *testing.T) {
 	base := t.TempDir()
 	dir := filepath.Join(base, "taskctl")
 	if err := os.Mkdir(dir, 0o755); err != nil {
@@ -758,8 +758,10 @@ func TestOpenTightensLoosePermissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat dir: %v", err)
 	}
-	if mode := dirInfo.Mode().Perm(); mode != 0o700 {
-		t.Errorf("directory mode = %04o, want 0700", mode)
+	// An existing parent directory belongs to the user's layout: Open must not
+	// chmod it, even when it is not private. doctor reports the mode instead.
+	if mode := dirInfo.Mode().Perm(); mode != 0o755 {
+		t.Errorf("directory mode = %04o, want 0755 (unchanged)", mode)
 	}
 	fileInfo, err := os.Stat(dbPath)
 	if err != nil {
@@ -767,5 +769,24 @@ func TestOpenTightensLoosePermissions(t *testing.T) {
 	}
 	if mode := fileInfo.Mode().Perm(); mode != 0o600 {
 		t.Errorf("database mode = %04o, want 0600", mode)
+	}
+}
+
+func TestOpenRejectsNewerSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	if _, err := db.Exec(`PRAGMA user_version = 99`); err != nil {
+		t.Fatalf("set version: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+
+	_, err = store.Open(path)
+	if err == nil || !strings.Contains(err.Error(), "newer than supported") {
+		t.Fatalf("open = %v, want a newer-schema error", err)
 	}
 }

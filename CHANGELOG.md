@@ -37,6 +37,17 @@ First tagged release.
   timeout.
 - Unknown statuses in the database are counted in `Stats.Unknown` instead of
   leaking into `by_status`.
+- SIGINT/SIGTERM ends a session whose stdin is still open and idle: the reader
+  no longer blocks shutdown, and the store is closed with a WAL checkpoint.
+- Valid JSON with wrong field types (for example a numeric `jsonrpc`) gets
+  `-32600` instead of `-32700`.
+- A full tools/call queue answers `-32603` instead of blocking delivery of
+  `notifications/cancelled`.
+- Opening the database no longer chmods an existing parent directory (for
+  example the current directory when the path is just `tasks.db`); `doctor`
+  reports a loose directory instead of silently fixing it.
+- `CheckWritable` rolls back with a context that cannot be cancelled and drops
+  a connection that still holds a transaction.
 - `name` and `content` are bounded (1 KiB / 1 MiB), validated as UTF-8 and the
   stored name is trimmed.
 

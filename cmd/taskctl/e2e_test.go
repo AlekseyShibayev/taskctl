@@ -198,8 +198,8 @@ func TestE2EStdioSession(t *testing.T) {
 	if err := cmd.Wait(); err != nil {
 		t.Fatalf("wait: %v (stderr %s)", err, stderr.String())
 	}
-	if stderr.Len() == 0 || !strings.Contains(stderr.String(), "parse error") {
-		t.Errorf("stderr must report the broken request and nothing else: %s", stderr.String())
+	if !strings.Contains(stderr.String(), "code=-32700") {
+		t.Errorf("stderr must report the broken request: %s", stderr.String())
 	}
 
 	if _, err := os.Stat(filepath.Join(dataDir, "taskctl", "tasks.db")); err != nil {

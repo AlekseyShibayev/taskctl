@@ -80,10 +80,15 @@ func runMCP(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) int 
 	}()
 
 	logger := logging.New(stderr)
-	if err := mcp.NewServer(st, version, logger).Serve(ctx, stdin, stdout); err != nil {
+	server := mcp.NewServer(st, version, logger)
+
+	// Serve returns on cancellation even when stdin is still open and blocked;
+	// the deferred Close then checkpoints the WAL.
+	if err := server.Serve(ctx, stdin, stdout); err != nil {
 		_, _ = fmt.Fprintf(stderr, "taskctl: %v\n", err)
 		return 1
 	}
+	logger.Debug("session finished")
 	return 0
 }
 
@@ -123,6 +128,16 @@ func runDoctor(ctx context.Context, args []string, stdout, stderr io.Writer) int
 
 	report, err := diagnose(ctx)
 	if err != nil {
+		if asJSON {
+			data, marshalErr := json.MarshalIndent(struct {
+				OK    bool   `json:"ok"`
+				Error string `json:"error"`
+			}{OK: false, Error: err.Error()}, "", "  ")
+			if marshalErr == nil {
+				_, _ = fmt.Fprintln(stdout, string(data))
+				return 1
+			}
+		}
 		_, _ = fmt.Fprintf(stderr, "taskctl: %v\n", err)
 		return 1
 	}

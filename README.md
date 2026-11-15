@@ -105,7 +105,7 @@ tools:                    # * = необязательный
 ← {"jsonrpc":"2.0","id":7,"error":{"code":-32600,"message":"invalid request: jsonrpc must be \"2.0\""}}
 ```
 
-Коды домена: `invalid_argument`, `not_found`, `invalid_transition`, `internal`. Протокол: `-32700` (parse error), `-32600` (invalid request / слишком большое сообщение), `-32601` (method not found), `-32602` (invalid params), `-32002` (до initialize), `-32800` (отмена или таймаут).
+Коды домена: `invalid_argument`, `not_found`, `invalid_transition`, `internal`. Протокол: `-32700` (parse error), `-32600` (invalid request / слишком большое сообщение), `-32601` (method not found), `-32602` (invalid params), `-32603` (очередь вызовов переполнена), `-32002` (до initialize), `-32800` (отмена или таймаут).
 
 ## Запуск
 

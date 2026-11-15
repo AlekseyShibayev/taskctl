@@ -182,3 +182,50 @@ func TestMCPStopsOnCancelledContext(t *testing.T) {
 		t.Fatalf("exit code = %d, stderr = %s", code, stderr.String())
 	}
 }
+
+func TestDoctorReportsLooseDirectory(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", dir)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"doctor"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("first doctor: %d, %s", code, stderr.String())
+	}
+	dataDir := filepath.Join(dir, "taskctl")
+	if err := os.Chmod(dataDir, 0o755); err != nil {
+		t.Fatalf("chmod data dir: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"doctor"}, strings.NewReader(""), &stdout, &stderr); code != 1 {
+		t.Fatalf("exit code = %d, want 1 for a loose directory", code)
+	}
+	if !strings.Contains(stdout.String(), "FAIL permissions") {
+		t.Errorf("stdout = %q", stdout.String())
+	}
+}
+
+func TestDoctorJSONOnOpenError(t *testing.T) {
+	base := t.TempDir()
+	blocker := filepath.Join(base, "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	t.Setenv("XDG_DATA_HOME", blocker)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"doctor", "--json"}, strings.NewReader(""), &stdout, &stderr); code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	var report struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("stdout is not JSON: %v (%s)", err, stdout.String())
+	}
+	if report.OK || report.Error == "" {
+		t.Errorf("report = %+v", report)
+	}
+}

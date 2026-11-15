@@ -29,6 +29,7 @@ const (
 	codeMethodNotFound       = -32601
 	codeInvalidParams        = -32602
 	codeServerNotInitialized = -32002
+	codeInternalError        = -32603
 	codeRequestCancelled     = -32800
 )
 
@@ -37,8 +38,8 @@ const (
 // client gets an error instead.
 const maxMessageSize = 4 << 20
 
-// callTimeout bounds one tools/call invocation.
-const callTimeout = 30 * time.Second
+// defaultCallTimeout bounds one tools/call invocation.
+const defaultCallTimeout = 30 * time.Second
 
 var errMessageTooLarge = errors.New("message exceeds maximum size")
 
@@ -70,6 +71,7 @@ type Server struct {
 	mu          sync.Mutex
 	initialized bool
 	inflight    map[string]context.CancelFunc
+	callTimeout time.Duration
 }
 
 // NewServer builds a server backed by st. A nil logger discards all logs.
@@ -78,10 +80,11 @@ func NewServer(st *store.Store, version string, logger *slog.Logger) *Server {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	return &Server{
-		store:    st,
-		version:  version,
-		logger:   logger,
-		inflight: make(map[string]context.CancelFunc),
+		store:       st,
+		version:     version,
+		logger:      logger,
+		inflight:    make(map[string]context.CancelFunc),
+		callTimeout: defaultCallTimeout,
 	}
 }
 
@@ -113,17 +116,22 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 		return nil
 	}
 
-	// Closing a blocking reader (os.Stdin) lets a signal end the loop.
+	// A blocked read (stdin from an MCP client) does not wake up on a signal by
+	// itself, and closing the file from another goroutine does not interrupt an
+	// in-flight read(2) either. A read deadline does: on cancellation the read
+	// returns immediately and the loop treats it as shutdown.
+	deadliner, canDeadline := r.(interface{ SetReadDeadline(time.Time) error })
 	done := make(chan struct{})
 	defer close(done)
-	if closer, ok := r.(io.Closer); ok {
+	if canDeadline {
 		go func() {
 			select {
 			case <-runCtx.Done():
-				_ = closer.Close()
+				_ = deadliner.SetReadDeadline(time.Now())
 			case <-done:
 			}
 		}()
+		defer func() { _ = deadliner.SetReadDeadline(time.Time{}) }()
 	}
 
 	type callJob struct {
@@ -132,6 +140,29 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 		cancel context.CancelFunc
 		key    string
 	}
+
+	// The reader runs in its own goroutine so Serve returns on cancellation even
+	// when read(2) is blocked (an inherited stdin cannot be interrupted from
+	// another goroutine). The goroutine may outlive Serve; it owns no state and
+	// the process exits right after a signal.
+	type readResult struct {
+		line []byte
+		err  error
+	}
+	messages := make(chan readResult)
+	go func() {
+		for {
+			line, err := readMessage(reader)
+			select {
+			case messages <- readResult{line: line, err: err}:
+			case <-runCtx.Done():
+				return
+			}
+			if err != nil && !errors.Is(err, errMessageTooLarge) {
+				return
+			}
+		}
+	}()
 
 	var wg sync.WaitGroup
 	// Buffered so the read loop is never stuck handing a request to a busy
@@ -164,10 +195,16 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	}()
 
 	for {
-		if runCtx.Err() != nil {
+		var (
+			line []byte
+			err  error
+		)
+		select {
+		case <-runCtx.Done():
 			return serveErr
+		case message := <-messages:
+			line, err = message.line, message.err
 		}
-		line, err := readMessage(reader)
 		if errors.Is(err, errMessageTooLarge) {
 			s.logger.Warn("rejecting oversized message", "limit_bytes", maxMessageSize)
 			if writeErr := write(parseFailure(codeInvalidRequest,
@@ -195,8 +232,14 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 
 		var req request
 		if err := json.Unmarshal(line, &req); err != nil {
-			s.logger.Warn("parse error", "error", err)
-			if err := write(parseFailure(codeParseError, "parse error: "+err.Error())); err != nil {
+			// Valid JSON with the wrong field types is an invalid request, not a
+			// parse error; only malformed JSON gets -32700.
+			code, message := codeParseError, "parse error: "+err.Error()
+			if json.Valid(line) {
+				code, message = codeInvalidRequest, "invalid request: "+err.Error()
+			}
+			s.logger.Warn("rejected message", "code", code, "error", err)
+			if err := write(parseFailure(code, message)); err != nil {
 				recordErr(err)
 				return serveErr
 			}
@@ -228,13 +271,31 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 		// Other methods are cheap and stay on the read loop.
 		if req.Method == "tools/call" {
 			key := idKey(req.ID)
-			callCtx, cancel := context.WithTimeout(runCtx, callTimeout)
+			timeout := s.callTimeout
+			if timeout <= 0 {
+				timeout = defaultCallTimeout
+			}
+			callCtx, cancel := context.WithTimeout(runCtx, timeout)
 			if key != "" {
 				s.mu.Lock()
 				s.inflight[key] = cancel
 				s.mu.Unlock()
 			}
-			jobs <- callJob{ctx: callCtx, req: req, cancel: cancel, key: key}
+			select {
+			case jobs <- callJob{ctx: callCtx, req: req, cancel: cancel, key: key}:
+			default:
+				// The queue is full: answer instead of blocking the read loop,
+				// which must stay available for cancellations.
+				cancel()
+				if key != "" {
+					s.clearInflight(key)
+				}
+				s.logger.Warn("tool call queue full")
+				if err := write(requestFailure(req, codeInternalError, "server busy: too many pending tool calls")); err != nil {
+					recordErr(err)
+					return serveErr
+				}
+			}
 			continue
 		}
 

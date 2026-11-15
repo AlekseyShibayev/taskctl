@@ -77,3 +77,58 @@ func TestCancellationStopsRunningTool(t *testing.T) {
 		t.Fatalf("no response for the cancelled request: %q", out.String())
 	}
 }
+
+// A call that outlives callTimeout must return -32800 instead of hanging.
+func TestCallTimeout(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	toolHandlers["hang"] = func(ctx context.Context, _ *store.Store, _ json.RawMessage) (any, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	t.Cleanup(func() { delete(toolHandlers, "hang") })
+
+	server := NewServer(st, "test", nil)
+	server.callTimeout = 50 * time.Millisecond
+
+	input := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"hang","arguments":{}}}`,
+	}, "\n") + "\n"
+
+	var out bytes.Buffer
+	started := time.Now()
+	if err := server.Serve(context.Background(), strings.NewReader(input), &out); err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("timeout took %s", elapsed)
+	}
+
+	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		var envelope struct {
+			ID    int `json:"id"`
+			Error *struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(line), &envelope); err != nil {
+			t.Fatalf("decode %q: %v", line, err)
+		}
+		if envelope.ID == 2 {
+			if envelope.Error == nil || envelope.Error.Code != codeRequestCancelled {
+				t.Fatalf("response = %+v, want code %d", envelope, codeRequestCancelled)
+			}
+			if !strings.Contains(envelope.Error.Message, "timed out") {
+				t.Errorf("message = %q", envelope.Error.Message)
+			}
+			return
+		}
+	}
+	t.Fatalf("no response for the timed-out call: %q", out.String())
+}

@@ -526,18 +526,19 @@ func TestInvalidJSONRPCVersion(t *testing.T) {
 	envelopes := runServerRaw(t, st,
 		`{"jsonrpc":"1.0","id":1,"method":"ping"}`,
 		`{"id":2,"method":"ping"}`,
-		encodeRequest(3, "ping", nil),
+		`{"jsonrpc":2.0,"id":3,"method":"ping"}`,
+		encodeRequest(4, "ping", nil),
 	)
-	if len(envelopes) != 3 {
-		t.Fatalf("responses = %d, want 3", len(envelopes))
+	if len(envelopes) != 4 {
+		t.Fatalf("responses = %d, want 4", len(envelopes))
 	}
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 3; i++ {
 		if envelopes[i].Error == nil || envelopes[i].Error.Code != -32600 {
 			t.Errorf("response %d = %+v, want -32600", i, envelopes[i].Error)
 		}
 	}
-	if envelopes[2].Error != nil {
-		t.Errorf("ping after invalid requests = %+v", envelopes[2].Error)
+	if envelopes[3].Error != nil {
+		t.Errorf("ping after invalid requests = %+v", envelopes[3].Error)
 	}
 }
 

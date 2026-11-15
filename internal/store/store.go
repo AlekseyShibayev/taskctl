@@ -111,7 +111,9 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db, path: path}, nil
 }
 
-// ensurePrivateDir creates dir (mode 0700) or tightens an existing one.
+// ensurePrivateDir creates dir (mode 0700) when missing. An existing directory
+// is left as is: its permissions may belong to the user's XDG layout, and
+// tightening an arbitrary parent directory is worse than reporting it.
 func ensurePrivateDir(dir string) error {
 	info, err := os.Stat(dir)
 	switch {
@@ -119,10 +121,7 @@ func ensurePrivateDir(dir string) error {
 		if !info.IsDir() {
 			return fmt.Errorf("%s is not a directory", dir)
 		}
-		if info.Mode().Perm()&0o077 == 0 {
-			return nil
-		}
-		return os.Chmod(dir, 0o700) //nolint:gosec // 0700 is deliberate for a private directory
+		return nil
 	case errors.Is(err, os.ErrNotExist):
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return err
@@ -201,7 +200,11 @@ func (s *Store) CheckWritable(ctx context.Context) error {
 	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return fmt.Errorf("begin write transaction: %w", err)
 	}
-	if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+	// Rollback must happen even when the context that started the transaction
+	// was cancelled; a connection still holding a transaction must not return
+	// to the pool.
+	if _, err := conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK"); err != nil {
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
 		return fmt.Errorf("rollback write transaction: %w", err)
 	}
 	return nil

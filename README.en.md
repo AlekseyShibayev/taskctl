@@ -105,7 +105,7 @@ Each line is one JSON-RPC message terminated by `\n`. Examples are abbreviated.
 ← {"jsonrpc":"2.0","id":7,"error":{"code":-32600,"message":"invalid request: jsonrpc must be \"2.0\""}}
 ```
 
-Domain codes: `invalid_argument`, `not_found`, `invalid_transition`, `internal`. Protocol: `-32700` (parse error), `-32600` (invalid request / oversized message), `-32601` (method not found), `-32602` (invalid params), `-32002` (before initialize), `-32800` (cancelled or timed out).
+Domain codes: `invalid_argument`, `not_found`, `invalid_transition`, `internal`. Protocol: `-32700` (parse error), `-32600` (invalid request / oversized message), `-32601` (method not found), `-32602` (invalid params), `-32603` (tool-call queue full), `-32002` (before initialize), `-32800` (cancelled or timed out).
 
 ## Install
 
