@@ -175,7 +175,7 @@ rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/taskctl"
 | Go | 1.25+ (see `go.mod`) |
 | MCP | 2024-11-05, 2025-03-26, 2025-06-18 |
 | SQLite | embedded `modernc.org/sqlite`, no CGO |
-| Clients | any stdio MCP client; verified with OpenCode |
+| Clients | any stdio MCP client; smoke-tested with the official Go SDK |
 
 ## Development
 
