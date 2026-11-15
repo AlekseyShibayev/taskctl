@@ -3,7 +3,9 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -310,6 +312,67 @@ func TestUpdateTransitions(t *testing.T) {
 				requireCode(t, err, store.CodeInvalidTransition)
 			})
 		}
+	}
+}
+
+// Concurrent updates of different fields must not overwrite each other: the
+// read-modify-write lives inside one write transaction, so both changes survive.
+func TestUpdateConcurrentFieldsAreNotLost(t *testing.T) {
+	st := newStore(t)
+	const rounds = 50
+
+	for i := 0; i < rounds; i++ {
+		task := mustAdd(t, st, "task")
+		inProgress := store.StatusInProgress
+		name := fmt.Sprintf("renamed-%d", i)
+
+		var wg sync.WaitGroup
+		errs := make(chan error, 2)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, err := st.Update(context.Background(), task.ID, store.Patch{Status: &inProgress})
+			errs <- err
+		}()
+		go func() {
+			defer wg.Done()
+			_, err := st.Update(context.Background(), task.ID, store.Patch{Name: &name})
+			errs <- err
+		}()
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("round %d: update: %v", i, err)
+			}
+		}
+
+		got, err := st.Get(context.Background(), task.ID)
+		if err != nil {
+			t.Fatalf("round %d: get: %v", i, err)
+		}
+		if got.Name != name || got.Status != store.StatusInProgress {
+			t.Fatalf("round %d: lost update: name = %q, status = %s", i, got.Name, got.Status)
+		}
+	}
+}
+
+// Update must never wait for a connection it is holding itself: the store keeps
+// a single connection, so every query inside the write transaction has to use it.
+func TestUpdateDoesNotDeadlockOnSingleConnection(t *testing.T) {
+	st := newStore(t)
+	task := mustAdd(t, st, "task")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	name := "renamed"
+	updated, err := st.Update(ctx, task.ID, store.Patch{Name: &name})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if updated.Name != name {
+		t.Errorf("name = %q, want %q", updated.Name, name)
 	}
 }
 

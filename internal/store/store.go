@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"net/url"
@@ -56,13 +57,28 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 	// One connection keeps writes serialised; this tool is single-user.
+	// Consequence: a transaction holds the only connection, so every query made
+	// while it is open must go through that connection (see withWriteTx), never
+	// through s.db — otherwise the call blocks until the context expires.
 	db.SetMaxOpenConns(1)
 
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("open database: %w", err)
 	}
-	if _, err := db.Exec(schema); err != nil {
+	// One transaction for the whole schema: a failure must not leave the table
+	// without its index.
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("initialise schema: %w", err)
+	}
+	if _, err := tx.Exec(schema); err != nil {
+		tx.Rollback()
+		db.Close()
+		return nil, fmt.Errorf("initialise schema: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("initialise schema: %w", err)
 	}
@@ -110,14 +126,24 @@ func (s *Store) Get(ctx context.Context, id int64) (Task, error) {
 	if id <= 0 {
 		return Task{}, invalidArgumentf("id must be a positive integer")
 	}
-	row := s.db.QueryRowContext(ctx,
+	return getTask(ctx, s.db, id, "read task")
+}
+
+// rowQuerier is satisfied by *sql.DB and *sql.Conn.
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// getTask reads one task through q; op labels the failure.
+func getTask(ctx context.Context, q rowQuerier, id int64, op string) (Task, error) {
+	row := q.QueryRowContext(ctx,
 		`SELECT id, name, content, status, created_at FROM tasks WHERE id = ?`, id)
 	task, err := scanTask(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Task{}, notFoundf("task %d not found", id)
 	}
 	if err != nil {
-		return Task{}, fmt.Errorf("read task: %w", err)
+		return Task{}, fmt.Errorf("%s: %w", op, err)
 	}
 	return task, nil
 }
@@ -202,37 +228,97 @@ func (s *Store) Update(ctx context.Context, id int64, patch Patch) (Task, error)
 	if patch.Name == nil && patch.Content == nil && patch.Status == nil {
 		return Task{}, invalidArgumentf("at least one of name, content or status is required")
 	}
+	if patch.Name != nil && strings.TrimSpace(*patch.Name) == "" {
+		return Task{}, invalidArgumentf("name must not be empty")
+	}
+	if patch.Status != nil && !patch.Status.Valid() {
+		return Task{}, invalidArgumentf("unknown status %q", *patch.Status)
+	}
 
-	current, err := s.Get(ctx, id)
+	var updated Task
+	err := s.withWriteTx(ctx, func(conn *sql.Conn) error {
+		current, err := getTask(ctx, conn, id, "update task")
+		if err != nil {
+			return err
+		}
+
+		sets := make([]string, 0, 3)
+		args := make([]any, 0, 5)
+		if patch.Name != nil {
+			sets = append(sets, "name = ?")
+			args = append(args, *patch.Name)
+		}
+		if patch.Content != nil {
+			sets = append(sets, "content = ?")
+			args = append(args, *patch.Content)
+		}
+		if patch.Status != nil {
+			// Checked against the row read in this transaction, not a snapshot.
+			if !current.Status.CanTransitionTo(*patch.Status) {
+				return invalidTransitionf("cannot change status from %s to %s", current.Status, *patch.Status)
+			}
+			sets = append(sets, "status = ?")
+			args = append(args, string(*patch.Status))
+		}
+		// Only changed columns are written; the status guard pins the write to
+		// the version that was read. Inside this transaction it cannot fire — it
+		// is the safety net for a writer that bypasses withWriteTx.
+		args = append(args, id, string(current.Status))
+		result, err := conn.ExecContext(ctx,
+			`UPDATE tasks SET `+strings.Join(sets, ", ")+` WHERE id = ? AND status = ?`, args...)
+		if err != nil {
+			return fmt.Errorf("update task: %w", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("update task: %w", err)
+		}
+		if affected == 0 {
+			return notFoundf("task %d not found", id)
+		}
+
+		// Return the row as stored, not the values computed from the read.
+		updated, err = getTask(ctx, conn, id, "update task")
+		return err
+	})
 	if err != nil {
 		return Task{}, err
 	}
+	return updated, nil
+}
 
-	if patch.Name != nil {
-		if strings.TrimSpace(*patch.Name) == "" {
-			return Task{}, invalidArgumentf("name must not be empty")
-		}
-		current.Name = *patch.Name
+// withWriteTx runs fn inside BEGIN IMMEDIATE: the write lock is taken before the
+// first read, so a read-modify-write cannot interleave with another process and
+// no update is lost. fn must reach the database through conn only — the store
+// keeps a single connection, so a query through s.db would wait for the
+// connection this transaction is holding, forever.
+func (s *Store) withWriteTx(ctx context.Context, fn func(conn *sql.Conn) error) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire connection: %w", err)
 	}
-	if patch.Content != nil {
-		current.Content = *patch.Content
-	}
-	if patch.Status != nil {
-		if !patch.Status.Valid() {
-			return Task{}, invalidArgumentf("unknown status %q", *patch.Status)
-		}
-		if !current.Status.CanTransitionTo(*patch.Status) {
-			return Task{}, invalidTransitionf("cannot change status from %s to %s", current.Status, *patch.Status)
-		}
-		current.Status = *patch.Status
-	}
+	defer conn.Close()
 
-	if _, err := s.db.ExecContext(ctx,
-		`UPDATE tasks SET name = ?, content = ?, status = ? WHERE id = ?`,
-		current.Name, current.Content, string(current.Status), id); err != nil {
-		return Task{}, fmt.Errorf("update task: %w", err)
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
 	}
-	return current, nil
+	if err := fn(conn); err != nil {
+		s.rollback(ctx, conn)
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		s.rollback(ctx, conn)
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+	return nil
+}
+
+// rollback undoes the open transaction. When the rollback itself fails, the
+// connection still holds the transaction and must not go back to the pool.
+func (s *Store) rollback(ctx context.Context, conn *sql.Conn) {
+	if _, err := conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK"); err != nil {
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	}
 }
 
 // Stats is a status histogram used by diagnostics.
