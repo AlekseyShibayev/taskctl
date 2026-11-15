@@ -3,7 +3,7 @@
 <img src="assets/banner.svg?v=11" alt="taskctl" width="800" valign="middle">
 
 Локальный трекер задач для агента: MCP поверх stdio, SQLite на рабочей машине,
-без сети.
+без сети. Только Linux (amd64, arm64).
 
 ## Установка
 
