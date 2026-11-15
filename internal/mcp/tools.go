@@ -185,10 +185,8 @@ func getTool(ctx context.Context, st *store.Store, raw json.RawMessage) (any, er
 
 func updateTool(ctx context.Context, st *store.Store, raw json.RawMessage) (any, error) {
 	var args struct {
-		ID      *int64  `json:"id"`
-		Name    *string `json:"name"`
-		Content *string `json:"content"`
-		Status  *string `json:"status"`
+		ID     *int64  `json:"id"`
+		Status *string `json:"status"`
 	}
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, err
@@ -196,16 +194,14 @@ func updateTool(ctx context.Context, st *store.Store, raw json.RawMessage) (any,
 	if args.ID == nil {
 		return nil, requiredArgumentf("id")
 	}
-
-	patch := store.Patch{Name: args.Name, Content: args.Content}
-	if args.Status != nil {
-		status, err := store.ParseStatus(*args.Status)
-		if err != nil {
-			return nil, err
-		}
-		patch.Status = &status
+	if args.Status == nil {
+		return nil, requiredArgumentf("status")
 	}
-	return st.Update(ctx, *args.ID, patch)
+	status, err := store.ParseStatus(*args.Status)
+	if err != nil {
+		return nil, err
+	}
+	return st.Update(ctx, *args.ID, store.Patch{Status: &status})
 }
 
 // requiredArgumentf reports a missing mandatory argument separately from a

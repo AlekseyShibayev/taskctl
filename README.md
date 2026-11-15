@@ -23,7 +23,7 @@ make install                      # ~/.local/bin/taskctl
 | `create` | `name`, `content` |
 | `slice` | `status*`, `limit*`, `offset*` |
 | `get` | `id` |
-| `update` | `id`, `name*`, `content*`, `status*` |
+| `update` | `id`, `status` |
 
 Переходы статусов: `create → in_progress → done`, назад `in_progress → create`
 (на доработку). `done` — терминальный. Задачи не удаляются.

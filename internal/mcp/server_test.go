@@ -271,9 +271,30 @@ func TestUpdateTransitions(t *testing.T) {
 	terminal := runServer(t, st, encodeTool(1, "update", map[string]any{"id": 1, "status": "in_progress"}))
 	requireToolError(t, terminal[0])
 
-	renamed := runServer(t, st, encodeTool(1, "update", map[string]any{"id": 1, "name": "renamed"}))
-	if payload, _ := toolPayload(t, renamed[0]); payload["name"] != "renamed" {
-		t.Fatalf("rename = %v", payload)
+}
+
+// update changes status only: name and content are rejected as unknown fields
+// and stay untouched.
+func TestUpdateRejectsNameAndContent(t *testing.T) {
+	st := newStore(t)
+	runServer(t, st, encodeTool(1, "create", map[string]any{"name": "original", "content": "body"}))
+
+	for _, args := range []map[string]any{
+		{"id": 1, "name": "renamed"},
+		{"id": 1, "content": "new body"},
+		{"id": 1, "name": "renamed", "status": "in_progress"},
+	} {
+		envelopes := runServer(t, st, encodeTool(1, "update", args))
+		requireToolError(t, envelopes[0])
+	}
+
+	noStatus := runServer(t, st, encodeTool(1, "update", map[string]any{"id": 1}))
+	requireToolError(t, noStatus[0])
+
+	current := runServer(t, st, encodeTool(1, "get", map[string]any{"id": 1}))
+	payload, _ := toolPayload(t, current[0])
+	if payload["name"] != "original" || payload["content"] != "body" || payload["status"] != "create" {
+		t.Fatalf("task changed: %v", payload)
 	}
 }
 
