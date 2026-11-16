@@ -19,7 +19,7 @@ make install                      # ~/.local/bin/taskctl
 
 MCP-клиент: `taskctl mcp`, stdio.
 
-Контракт и критерии приёмки — `SPEC.md`; как писать спеки — `docs/spec-guide.md`.
+Контракт и критерии приёмки — `SPEC.md`.
 
 ## MCP-инструменты
 

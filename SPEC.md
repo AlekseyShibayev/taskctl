@@ -128,4 +128,4 @@ JSON-RPC и рукопожатие MCP.
 `cmd/taskctl/main.go`.
 Тесты: `internal/store/store_test.go`, `internal/mcp/server_test.go`,
 `cmd/taskctl/main_test.go`, `cmd/taskctl/e2e_test.go`.
-Установка и запуск — `README.md`; правила написания спек — `docs/spec-guide.md`.
+Установка и запуск — `README.md`.
