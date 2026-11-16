@@ -1,6 +1,6 @@
 # taskctl
 
-![taskctl](https://raw.githubusercontent.com/AlekseyShibayev/taskctl/main/assets/banner.svg?v=bcfdd86f)
+![taskctl](https://raw.githubusercontent.com/AlekseyShibayev/taskctl/main/assets/banner.svg?v=bcfdd86f2)
 
 Локальная очередь задач для агента: MCP поверх stdio, SQLite на рабочей машине,
 без сети. ОС: Linux.
