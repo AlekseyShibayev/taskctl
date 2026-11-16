@@ -19,22 +19,16 @@ MCP-клиент: `taskctl mcp`, stdio.
 ## MCP-инструменты
 
 | Инструмент | Аргументы |
-| --- | --- |
-| `create` | `name`, `content` |
-| `slice` | `status*`, `limit*`, `offset*` |
-| `get` | `id` |
-| `update` | `id`, `status` |
-
-Переходы статусов: `create → in_progress → done`, назад `in_progress → create`.
-`done` — терминальный. Задачи не удаляются.
+|------------|-----------|
+| `add`      | `text`    |
+| `get`      |           |
 
 ## Схема данных
 
 ```yaml
 tasks:
   id:         int
-  name:       str
-  content:    str
-  status:     enum create | in_progress | done
-  created_at: datetime
+  text:       str
+  add_at:     datetime
+  get_at:     datetime
 ```
