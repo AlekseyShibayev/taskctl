@@ -2,8 +2,11 @@
 
 ![taskctl](https://raw.githubusercontent.com/AlekseyShibayev/taskctl/main/assets/banner.svg)
 
-Локальный трекер задач для агента: MCP поверх stdio, SQLite на рабочей машине,
+Локальная очередь задач для агента: MCP поверх stdio, SQLite на рабочей машине,
 без сети. ОС: Linux.
+
+`create` кладёт задачу, `get` атомарно забирает самую старую невзятую
+(`get_at IS NULL`) и проставляет `get_at`. Задача берётся не более одного раза.
 
 ## Установка
 
@@ -20,7 +23,7 @@ MCP-клиент: `taskctl mcp`, stdio.
 
 | Инструмент | Аргументы |
 |------------|-----------|
-| `add`      | `text`    |
+| `create`   | `text`    |
 | `get`      |           |
 
 ## Схема данных
@@ -29,6 +32,6 @@ MCP-клиент: `taskctl mcp`, stdio.
 tasks:
   id:         int
   text:       str
-  add_at:     datetime
-  get_at:     datetime
+  create_at:  datetime
+  get_at:     datetime  # null, пока задачу не взяли
 ```

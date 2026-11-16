@@ -329,9 +329,9 @@ func (s *Server) initialize() initializeResult {
 		ProtocolVersion: protocolVersion,
 		Capabilities:    capabilities{Tools: &toolsCapability{}},
 		ServerInfo:      serverInfo{Name: "taskctl", Version: s.version},
-		Instructions: "Local task tracker. Use create to make a task, slice and get to read tasks, " +
-			"update to change status. Statuses: create -> in_progress -> done; " +
-			"in_progress -> create sends a task back for rework. Tasks are never deleted.",
+		Instructions: "Local task queue. create stores a task as unclaimed; get takes the oldest " +
+			"unclaimed task (get_at null) and marks it taken. Tasks are never deleted, " +
+			"so a task can be taken at most once.",
 	}
 }
 

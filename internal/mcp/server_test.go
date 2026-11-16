@@ -127,20 +127,8 @@ func toolPayload(t *testing.T, envelope rpcEnvelope) (map[string]any, bool) {
 
 func requireToolError(t *testing.T, envelope rpcEnvelope) {
 	t.Helper()
-	var result struct {
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
-		IsError bool `json:"isError"`
-	}
-	if err := json.Unmarshal(envelope.Result, &result); err != nil {
-		t.Fatalf("decode tool result: %v (%s)", err, envelope.Result)
-	}
-	if !result.IsError {
-		t.Fatalf("expected isError, got %s", envelope.Result)
-	}
-	if len(result.Content) == 0 || result.Content[0].Text == "" {
-		t.Fatalf("error has no message: %s", envelope.Result)
+	if text := toolErrorText(t, envelope); text == "" {
+		t.Fatal("tool error has no message")
 	}
 }
 
@@ -222,123 +210,49 @@ func TestToolsList(t *testing.T) {
 			t.Errorf("%s: incomplete definition", tool.Name)
 		}
 	}
-	if got := strings.Join(names, ","); got != "create,slice,get,update" {
+	if got := strings.Join(names, ","); got != "create,get" {
 		t.Errorf("tools = %s", got)
 	}
 }
 
-func TestAddShowListUpdate(t *testing.T) {
+func TestCreateAndGet(t *testing.T) {
 	st := newStore(t)
-	added := runServer(t, st, encodeTool(1, "create", map[string]any{"name": "  fix doctor  ", "content": "check perms"}))
-	payload, isError := toolPayload(t, added[0])
+
+	created := runServer(t, st, encodeTool(1, "create", map[string]any{"text": "  first task  "}))
+	payload, isError := toolPayload(t, created[0])
 	if isError {
-		t.Fatalf("add failed: %v", payload)
+		t.Fatalf("create failed: %v", payload)
 	}
-	if payload["name"] != "fix doctor" || payload["status"] != "create" || payload["id"] != float64(1) {
-		t.Fatalf("add = %v", payload)
-	}
-
-	shown := runServer(t, st, encodeTool(1, "get", map[string]any{"id": 1}))
-	if payload, _ := toolPayload(t, shown[0]); payload["content"] != "check perms" {
-		t.Fatalf("show = %v", payload)
+	if payload["id"] != float64(1) || payload["text"] != "  first task  " || payload["get_at"] != nil {
+		t.Fatalf("create = %v", payload)
 	}
 
-	updated := runServer(t, st, encodeTool(1, "update", map[string]any{"id": 1, "status": "in_progress"}))
-	if payload, _ := toolPayload(t, updated[0]); payload["status"] != "in_progress" {
-		t.Fatalf("update = %v", payload)
+	second := runServer(t, st, encodeTool(1, "create", map[string]any{"text": "second task"}))
+	if payload, _ := toolPayload(t, second[0]); payload["id"] != float64(2) {
+		t.Fatalf("second create = %v", payload)
 	}
 
-	listed := runServer(t, st, encodeTool(1, "slice", map[string]any{"status": "in_progress"}))
-	payload, _ = toolPayload(t, listed[0])
-	tasks, ok := payload["tasks"].([]any)
-	if !ok || len(tasks) != 1 || payload["hasNext"] != false {
-		t.Fatalf("list = %v", payload)
+	// get takes the oldest unclaimed task and stamps get_at.
+	taken := runServer(t, st, encodeTool(1, "get", nil))
+	payload, isError = toolPayload(t, taken[0])
+	if isError {
+		t.Fatalf("get failed: %v", payload)
 	}
-}
-
-func TestListPaginationAndBounds(t *testing.T) {
-	st := newStore(t)
-	for i := 1; i <= 3; i++ {
-		runServer(t, st, encodeTool(i, "create", map[string]any{"name": "task", "content": "details"}))
+	if payload["id"] != float64(1) || payload["text"] != "  first task  " {
+		t.Fatalf("first get = %v", payload)
 	}
-	listed := runServer(t, st, encodeTool(1, "slice", map[string]any{"limit": 2, "offset": 0}))
-	payload, _ := toolPayload(t, listed[0])
-	if tasks := payload["tasks"].([]any); len(tasks) != 2 || payload["hasNext"] != true {
-		t.Fatalf("page = %v", payload)
+	if takenAt, ok := payload["get_at"].(string); !ok || takenAt == "" {
+		t.Fatalf("get_at = %v, want a timestamp", payload["get_at"])
 	}
 
-	bad := runServer(t, st,
-		encodeTool(1, "slice", map[string]any{"limit": 0}),
-		encodeTool(2, "slice", map[string]any{"offset": -1}),
-		encodeTool(3, "slice", map[string]any{"status": "nope"}),
-	)
-	for _, envelope := range bad {
-		requireToolError(t, envelope)
-	}
-}
-
-// TestSliceErrorMessages pins what the client reads: the allowed range with the
-// offending value, and the enum for an unknown status.
-func TestSliceErrorMessages(t *testing.T) {
-	st := newStore(t)
-	envelopes := runServer(t, st,
-		encodeTool(1, "slice", map[string]any{"limit": 51}),
-		encodeTool(2, "slice", map[string]any{"status": "nope"}),
-	)
-	want := []string{
-		"limit must be between 1 and 50, got 51",
-		`unknown status "nope": expected one of [create in_progress done]`,
-	}
-	for i, envelope := range envelopes {
-		if got := toolErrorText(t, envelope); got != want[i] {
-			t.Errorf("error %d = %q, want %q", i, got, want[i])
-		}
+	next := runServer(t, st, encodeTool(1, "get", nil))
+	if payload, _ := toolPayload(t, next[0]); payload["id"] != float64(2) {
+		t.Fatalf("second get = %v", payload)
 	}
 
-	listed := runServer(t, st, encodeTool(1, "slice", map[string]any{"limit": 50}))
-	if payload, isError := toolPayload(t, listed[0]); isError || payload["limit"] != float64(50) {
-		t.Fatalf("limit 50 = %v (isError=%v)", payload, isError)
-	}
-}
-
-func TestUpdateTransitions(t *testing.T) {
-	st := newStore(t)
-	runServer(t, st, encodeTool(1, "create", map[string]any{"name": "task", "content": "details"}))
-
-	invalid := runServer(t, st, encodeTool(1, "update", map[string]any{"id": 1, "status": "done"}))
-	requireToolError(t, invalid[0])
-
-	runServer(t, st,
-		encodeTool(1, "update", map[string]any{"id": 1, "status": "in_progress"}),
-		encodeTool(2, "update", map[string]any{"id": 1, "status": "done"}),
-	)
-	terminal := runServer(t, st, encodeTool(1, "update", map[string]any{"id": 1, "status": "in_progress"}))
-	requireToolError(t, terminal[0])
-
-}
-
-// update changes status only: name and content are rejected as unknown fields
-// and stay untouched.
-func TestUpdateRejectsNameAndContent(t *testing.T) {
-	st := newStore(t)
-	runServer(t, st, encodeTool(1, "create", map[string]any{"name": "original", "content": "body"}))
-
-	for _, args := range []map[string]any{
-		{"id": 1, "name": "renamed"},
-		{"id": 1, "content": "new body"},
-		{"id": 1, "name": "renamed", "status": "in_progress"},
-	} {
-		envelopes := runServer(t, st, encodeTool(1, "update", args))
-		requireToolError(t, envelopes[0])
-	}
-
-	noStatus := runServer(t, st, encodeTool(1, "update", map[string]any{"id": 1}))
-	requireToolError(t, noStatus[0])
-
-	current := runServer(t, st, encodeTool(1, "get", map[string]any{"id": 1}))
-	payload, _ := toolPayload(t, current[0])
-	if payload["name"] != "original" || payload["content"] != "body" || payload["status"] != "create" {
-		t.Fatalf("task changed: %v", payload)
+	empty := runServer(t, st, encodeTool(1, "get", nil))
+	if text := toolErrorText(t, empty[0]); !strings.Contains(text, "queue is empty") {
+		t.Fatalf("get on empty queue = %q", text)
 	}
 }
 
@@ -347,21 +261,30 @@ func TestArgumentAndDispatchErrors(t *testing.T) {
 	envelopes := runServer(t, st,
 		encodeRequest(1, "tools/call", map[string]any{"name": "nope"}),
 		encodeTool(2, "create", map[string]any{}),
-		encodeTool(7, "create", map[string]any{"name": "no content"}),
-		encodeTool(3, "get", map[string]any{}),
-		encodeTool(4, "get", map[string]any{"id": 42}),
-		encodeTool(5, "create", map[string]any{"name": "x", "content": "y", "extra": 1}),
-		encodeTool(6, "update", map[string]any{"id": 1}),
+		encodeTool(3, "create", map[string]any{"text": ""}),
+		encodeTool(4, "create", map[string]any{"text": "x", "extra": 1}),
+		encodeTool(5, "get", map[string]any{"id": 1}),
+		encodeTool(6, "get", nil),
 	)
 	if envelopes[0].Error == nil || envelopes[0].Error.Code != -32602 {
 		t.Errorf("unknown tool = %+v", envelopes[0])
 	}
-	requireToolError(t, envelopes[1])
-	requireToolError(t, envelopes[2])
-	requireToolError(t, envelopes[3])
-	requireToolError(t, envelopes[4])
-	requireToolError(t, envelopes[5])
-	requireToolError(t, envelopes[6])
+	for _, envelope := range envelopes[1:] {
+		requireToolError(t, envelope)
+	}
+}
+
+// One task is enough for one client: a second get finds nothing to take.
+func TestGetTakesEachTaskOnce(t *testing.T) {
+	st := newStore(t)
+	runServer(t, st, encodeTool(1, "create", map[string]any{"text": "only"}))
+
+	taken := runServer(t, st, encodeTool(1, "get", nil))
+	if _, isError := toolPayload(t, taken[0]); isError {
+		t.Fatalf("get = %v", taken[0].Result)
+	}
+	again := runServer(t, st, encodeTool(1, "get", nil))
+	requireToolError(t, again[0])
 }
 
 func TestParseErrorDoesNotStopServer(t *testing.T) {
@@ -402,7 +325,7 @@ func TestInitializeRequired(t *testing.T) {
 	st := newStore(t)
 	envelopes := runServerRaw(t, st,
 		encodeRequest(1, "tools/list", nil),
-		encodeTool(2, "create", map[string]any{"name": "task", "content": "details"}),
+		encodeTool(2, "create", map[string]any{"text": "task"}),
 	)
 	for _, envelope := range envelopes {
 		if envelope.Error == nil || envelope.Error.Code != -32002 {
@@ -452,16 +375,13 @@ func TestToolsCallWithoutIDHasNoEffect(t *testing.T) {
 	st := newStore(t)
 	envelopes := runServerRaw(t, st,
 		encodeRequest(1, "initialize", map[string]any{}),
-		encodeRequest(nil, "tools/call", map[string]any{"name": "create", "arguments": map[string]any{"name": "task", "content": "details"}}),
-		encodeTool(2, "slice", nil),
+		encodeRequest(nil, "tools/call", map[string]any{"name": "create", "arguments": map[string]any{"text": "task"}}),
+		encodeTool(2, "get", nil),
 	)
-	// The id-less call is a notification: no response and no task.
+	// The id-less call is a notification: no task was created, so get fails.
 	for _, envelope := range envelopes {
 		if string(envelope.ID) == "2" {
-			payload, _ := toolPayload(t, envelope)
-			if total := payload["tasks"].([]any); len(total) != 0 {
-				t.Fatalf("tasks = %v", total)
-			}
+			requireToolError(t, envelope)
 		}
 	}
 }
@@ -473,36 +393,5 @@ func TestEmptyInput(t *testing.T) {
 	}
 	if out.Len() != 0 {
 		t.Errorf("output = %q", out.String())
-	}
-}
-
-// The public API must not let a done task change either: name, content and any
-// status move are rejected, and the stored record stays as it was.
-func TestUpdateDoneIsRejected(t *testing.T) {
-	st := newStore(t)
-	runServer(t, st, encodeTool(1, "create", map[string]any{"name": "task", "content": "body"}))
-	runServer(t, st,
-		encodeTool(1, "update", map[string]any{"id": 1, "status": "in_progress"}),
-		encodeTool(2, "update", map[string]any{"id": 1, "status": "done"}),
-	)
-
-	for _, args := range []map[string]any{
-		{"id": 1, "name": "renamed"},
-		{"id": 1, "content": "rewritten"},
-		{"id": 1, "name": "renamed", "content": "rewritten"},
-		{"id": 1, "status": "create"},
-		{"id": 1, "status": "in_progress"},
-		{"id": 1, "name": "renamed", "status": "create"},
-		{"id": 1, "content": "rewritten", "status": "in_progress"},
-		{"id": 1, "name": "renamed", "content": "rewritten", "status": "create"},
-	} {
-		envelopes := runServer(t, st, encodeTool(1, "update", args))
-		requireToolError(t, envelopes[0])
-	}
-
-	current := runServer(t, st, encodeTool(1, "get", map[string]any{"id": 1}))
-	payload, _ := toolPayload(t, current[0])
-	if payload["name"] != "task" || payload["content"] != "body" || payload["status"] != "done" {
-		t.Fatalf("done task changed: %v", payload)
 	}
 }

@@ -11,7 +11,7 @@ import (
 )
 
 // TestStdioSmoke builds the binary and drives one real MCP session over pipes:
-// initialize, tools/list, add, list and a failing show. Every line the server
+// initialize, tools/list, two creates and three gets. Every line the server
 // writes must be a JSON-RPC envelope; mixing logs into stdout breaks MCP.
 func TestStdioSmoke(t *testing.T) {
 	if testing.Short() {
@@ -64,7 +64,7 @@ func TestStdioSmoke(t *testing.T) {
 		}
 		return envelope
 	}
-	toolPayload := func(envelope map[string]any) map[string]any {
+	toolText := func(envelope map[string]any) (map[string]any, bool) {
 		t.Helper()
 		result, _ := envelope["result"].(map[string]any)
 		content, _ := result["content"].([]any)
@@ -72,11 +72,12 @@ func TestStdioSmoke(t *testing.T) {
 			t.Fatalf("content = %v", content)
 		}
 		text := content[0].(map[string]any)["text"].(string)
+		isError, _ := result["isError"].(bool)
 		var payload map[string]any
 		if err := json.Unmarshal([]byte(text), &payload); err != nil {
-			t.Fatalf("payload %q: %v", text, err)
+			return map[string]any{"message": text}, isError
 		}
-		return payload
+		return payload, isError
 	}
 
 	init := request(1, "initialize", map[string]any{"protocolVersion": "2025-06-18"})
@@ -89,34 +90,42 @@ func TestStdioSmoke(t *testing.T) {
 	for _, tool := range tools["result"].(map[string]any)["tools"].([]any) {
 		names = append(names, tool.(map[string]any)["name"].(string))
 	}
-	if got := strings.Join(names, ","); got != "create,slice,get,update" {
+	if got := strings.Join(names, ","); got != "create,get" {
 		t.Fatalf("tools = %s", got)
 	}
 
-	added := toolPayload(request(3, "tools/call", map[string]any{
-		"name": "create", "arguments": map[string]any{"name": "smoke task", "content": "via stdio"},
-	}))
-	if added["id"] != float64(1) || added["status"] != "create" {
-		t.Fatalf("add = %v", added)
-	}
-
-	listed := toolPayload(request(4, "tools/call", map[string]any{
-		"name": "slice", "arguments": map[string]any{},
-	}))
-	if tasks, _ := listed["tasks"].([]any); len(tasks) != 1 {
-		t.Fatalf("list = %v", listed)
-	}
-
-	missing := request(5, "tools/call", map[string]any{
-		"name": "get", "arguments": map[string]any{"id": 999},
+	created := request(3, "tools/call", map[string]any{
+		"name": "create", "arguments": map[string]any{"text": "smoke task"},
 	})
-	result := missing["result"].(map[string]any)
-	if isError, _ := result["isError"].(bool); !isError {
-		t.Fatalf("show 999 = %v", missing)
+	payload, _ := toolText(created)
+	if payload["id"] != float64(1) || payload["text"] != "smoke task" || payload["get_at"] != nil {
+		t.Fatalf("create = %v", payload)
 	}
-	content := result["content"].([]any)[0].(map[string]any)["text"].(string)
-	if !strings.Contains(content, "not found") {
-		t.Fatalf("show 999 = %q", content)
+
+	second := request(4, "tools/call", map[string]any{
+		"name": "create", "arguments": map[string]any{"text": "second task"},
+	})
+	if payload, _ := toolText(second); payload["id"] != float64(2) {
+		t.Fatalf("second create = %v", payload)
+	}
+
+	taken := request(5, "tools/call", map[string]any{"name": "get", "arguments": map[string]any{}})
+	payload, isError := toolText(taken)
+	if isError || payload["id"] != float64(1) || payload["text"] != "smoke task" {
+		t.Fatalf("first get = %v", payload)
+	}
+	if when, ok := payload["get_at"].(string); !ok || when == "" {
+		t.Fatalf("get_at = %v", payload["get_at"])
+	}
+
+	next := request(6, "tools/call", map[string]any{"name": "get", "arguments": map[string]any{}})
+	if payload, _ := toolText(next); payload["id"] != float64(2) {
+		t.Fatalf("second get = %v", payload)
+	}
+
+	empty := request(7, "tools/call", map[string]any{"name": "get", "arguments": map[string]any{}})
+	if _, isError := toolText(empty); !isError {
+		t.Fatalf("get on empty queue = %v", empty)
 	}
 
 	if err := stdin.Close(); err != nil {

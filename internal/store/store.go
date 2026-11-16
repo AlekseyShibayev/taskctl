@@ -3,12 +3,12 @@ package store
 import (
 	"context"
 	"database/sql"
-	"database/sql/driver"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -17,29 +17,27 @@ import (
 	_ "modernc.org/sqlite" // register the pure-Go sqlite driver
 )
 
-// Pagination bounds for List: one page holds the default number of tasks unless
-// the caller asks for fewer.
-const (
-	DefaultLimit = 50
-	MaxLimit     = 50
-)
+// MaxTextBytes bounds one task: a single row must not be able to grow the
+// database and every MCP response without bound.
+const MaxTextBytes = 1 << 20 // 1 MiB
 
-// Field limits: one task must not be able to grow the database and every MCP
-// response without bound.
-const (
-	MaxNameBytes    = 1 << 10 // 1 KiB
-	MaxContentBytes = 1 << 20 // 1 MiB
-)
+// ErrEmpty reports that every stored task has already been taken.
+var ErrEmpty = errors.New("queue is empty: every task has been taken")
 
 const createTasksTable = `CREATE TABLE IF NOT EXISTS tasks (
-	id         INTEGER PRIMARY KEY AUTOINCREMENT,
-	name       TEXT NOT NULL,
-	content    TEXT NOT NULL DEFAULT '',
-	status     TEXT NOT NULL DEFAULT 'create',
-	created_at TEXT NOT NULL
+	id        INTEGER PRIMARY KEY AUTOINCREMENT,
+	text      TEXT NOT NULL,
+	create_at TEXT NOT NULL,
+	get_at    TEXT
 )`
 
-const createTasksIndex = `CREATE INDEX IF NOT EXISTS tasks_status_id ON tasks (status, id)`
+// The index covers only unclaimed tasks, so taking the oldest one reads its
+// first entry instead of scanning the table. AUTOINCREMENT keeps ids monotonic,
+// so id order is creation order.
+const createTasksIndex = `CREATE INDEX IF NOT EXISTS tasks_unclaimed ON tasks (id) WHERE get_at IS NULL`
+
+// expectedColumns is the exact schema this build reads and writes.
+var expectedColumns = []string{"id", "text", "create_at", "get_at"}
 
 // Store owns the SQLite database.
 type Store struct {
@@ -80,9 +78,6 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 	// One connection keeps writes serialised; this tool is single-user.
-	// Consequence: a transaction holds the only connection, so every query made
-	// while it is open must go through that connection (see withWriteTx), never
-	// through s.db — otherwise the call blocks until the context expires.
 	db.SetMaxOpenConns(1)
 
 	if err := db.Ping(); err != nil {
@@ -95,7 +90,7 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("restrict database permissions: %w", err)
 	}
-	if err := ensureSchema(context.Background(), db); err != nil {
+	if err := ensureSchema(context.Background(), db, path); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -123,15 +118,68 @@ func ensurePrivateDir(dir string) error {
 	}
 }
 
-// ensureSchema creates the table and index on a new database. There is no
-// version stamp and no migration path: the schema is one CREATE and will not
-// evolve for a local tool.
-func ensureSchema(ctx context.Context, db *sql.DB) error {
-	if _, err := db.ExecContext(ctx, createTasksTable); err != nil {
+// ensureSchema creates the table and index on a new database and verifies the
+// shape of an existing one. There is no version stamp and no migration path:
+// the schema is one CREATE and will not evolve for a local tool.
+func ensureSchema(ctx context.Context, db *sql.DB, path string) error {
+	exists, err := tableExists(ctx, db)
+	if err != nil {
+		return err
+	}
+	if exists {
+		if err := checkSchema(ctx, db, path); err != nil {
+			return err
+		}
+	} else if _, err := db.ExecContext(ctx, createTasksTable); err != nil {
 		return fmt.Errorf("initialise schema: %w", err)
 	}
 	if _, err := db.ExecContext(ctx, createTasksIndex); err != nil {
 		return fmt.Errorf("initialise schema: %w", err)
+	}
+	return nil
+}
+
+func tableExists(ctx context.Context, db *sql.DB) (bool, error) {
+	var count int
+	err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'tasks'`).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("read schema: %w", err)
+	}
+	return count > 0, nil
+}
+
+// checkSchema refuses a database left behind by an older taskctl. Its rows have
+// no get_at, so the queue queries cannot read it, and guessing a translation
+// would silently invent which tasks were taken.
+func checkSchema(ctx context.Context, db *sql.DB, path string) error {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(tasks)`)
+	if err != nil {
+		return fmt.Errorf("read schema: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var columns []string
+	for rows.Next() {
+		var (
+			position     int
+			name         string
+			kind         string
+			notNull      int
+			defaultValue sql.NullString
+			primaryKey   int
+		)
+		if err := rows.Scan(&position, &name, &kind, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("read schema: %w", err)
+		}
+		columns = append(columns, name)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read schema: %w", err)
+	}
+	if !slices.Equal(columns, expectedColumns) {
+		return fmt.Errorf("database %s has an incompatible schema: columns %v, want %v; "+
+			"it was created by an older taskctl and must be removed", path, columns, expectedColumns)
 	}
 	return nil
 }
@@ -152,24 +200,15 @@ func (s *Store) Close() error {
 	return s.closeErr
 }
 
-// Add creates a task in status create.
-func (s *Store) Add(ctx context.Context, name string, content *string) (Task, error) {
-	name, err := validateName(name)
-	if err != nil {
+// Add stores text as a new task with get_at null.
+func (s *Store) Add(ctx context.Context, text string) (Task, error) {
+	if err := validateText(text); err != nil {
 		return Task{}, err
-	}
-	body := ""
-	if content != nil {
-		if err := validateContent(*content); err != nil {
-			return Task{}, err
-		}
-		body = *content
 	}
 	createdAt := time.Now().UTC().Truncate(time.Second)
 
 	result, err := s.db.ExecContext(ctx,
-		`INSERT INTO tasks (name, content, status, created_at) VALUES (?, ?, ?, ?)`,
-		name, body, string(StatusCreate), formatTime(createdAt))
+		`INSERT INTO tasks (text, create_at) VALUES (?, ?)`, text, formatTime(createdAt))
 	if err != nil {
 		return Task{}, fmt.Errorf("insert task: %w", err)
 	}
@@ -177,257 +216,40 @@ func (s *Store) Add(ctx context.Context, name string, content *string) (Task, er
 	if err != nil {
 		return Task{}, fmt.Errorf("insert task: %w", err)
 	}
-	return Task{
-		ID:        id,
-		Name:      name,
-		Content:   body,
-		Status:    StatusCreate,
-		CreatedAt: createdAt,
-	}, nil
+	return Task{ID: id, Text: text, CreateAt: createdAt}, nil
 }
 
-// validateName trims the name, rejects blank and oversized values.
-func validateName(name string) (string, error) {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return "", fmt.Errorf("name must not be empty")
-	}
-	if !utf8.ValidString(name) {
-		return "", fmt.Errorf("name must be valid UTF-8")
-	}
-	if len(name) > MaxNameBytes {
-		return "", fmt.Errorf("name must be at most %d bytes", MaxNameBytes)
-	}
-	return name, nil
-}
+// Take marks the oldest unclaimed task as taken and returns it. The read and
+// the write are one statement, so two callers never take the same task.
+func (s *Store) Take(ctx context.Context) (Task, error) {
+	claimedAt := time.Now().UTC().Truncate(time.Second)
 
-// validateContent keeps content as sent, but bounds its size.
-func validateContent(content string) error {
-	if !utf8.ValidString(content) {
-		return fmt.Errorf("content must be valid UTF-8")
-	}
-	if len(content) > MaxContentBytes {
-		return fmt.Errorf("content must be at most %d bytes", MaxContentBytes)
-	}
-	return nil
-}
-
-// Get returns one task by id.
-func (s *Store) Get(ctx context.Context, id int64) (Task, error) {
-	if id <= 0 {
-		return Task{}, fmt.Errorf("id must be a positive integer")
-	}
-	return getTask(ctx, s.db, id, "read task")
-}
-
-// rowQuerier is satisfied by *sql.DB and *sql.Conn.
-type rowQuerier interface {
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-}
-
-// getTask reads one task through q; op labels the failure.
-func getTask(ctx context.Context, q rowQuerier, id int64, op string) (Task, error) {
-	row := q.QueryRowContext(ctx,
-		`SELECT id, name, content, status, created_at FROM tasks WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx,
+		`UPDATE tasks SET get_at = ?
+		 WHERE id = (SELECT id FROM tasks WHERE get_at IS NULL ORDER BY id LIMIT 1)
+		 RETURNING id, text, create_at, get_at`, formatTime(claimedAt))
 	task, err := scanTask(row)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Task{}, fmt.Errorf("task %d not found", id)
+		return Task{}, ErrEmpty
 	}
 	if err != nil {
-		return Task{}, fmt.Errorf("%s: %w", op, err)
+		return Task{}, fmt.Errorf("take task: %w", err)
 	}
 	return task, nil
 }
 
-// ListFilter narrows a List call. Zero Limit means DefaultLimit.
-type ListFilter struct {
-	Status *Status
-	Limit  int
-	Offset int
-}
-
-// Page is one page of tasks ordered by id.
-type Page struct {
-	Tasks   []Task `json:"tasks"`
-	Limit   int    `json:"limit"`
-	Offset  int    `json:"offset"`
-	HasNext bool   `json:"hasNext"`
-}
-
-// List returns tasks ordered by id with pagination.
-func (s *Store) List(ctx context.Context, filter ListFilter) (Page, error) {
-	limit := filter.Limit
-	if limit == 0 {
-		limit = DefaultLimit
+// validateText keeps text as sent, but rejects values that cannot be a task.
+func validateText(text string) error {
+	if strings.TrimSpace(text) == "" {
+		return errors.New("text must not be empty")
 	}
-	if limit < 1 || limit > MaxLimit {
-		return Page{}, fmt.Errorf("limit must be between 1 and %d, got %d", MaxLimit, limit)
+	if !utf8.ValidString(text) {
+		return errors.New("text must be valid UTF-8")
 	}
-	if filter.Offset < 0 {
-		return Page{}, fmt.Errorf("offset must not be negative, got %d", filter.Offset)
-	}
-	if filter.Status != nil {
-		if _, err := ParseStatus(string(*filter.Status)); err != nil {
-			return Page{}, err
-		}
-	}
-
-	query := `SELECT id, name, content, status, created_at FROM tasks`
-	args := make([]any, 0, 2)
-	if filter.Status != nil {
-		query += ` WHERE status = ?`
-		args = append(args, string(*filter.Status))
-	}
-	query += ` ORDER BY id LIMIT ? OFFSET ?`
-	args = append(args, limit+1, filter.Offset)
-
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return Page{}, fmt.Errorf("list tasks: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	tasks := make([]Task, 0, limit)
-	for rows.Next() {
-		task, err := scanTask(rows)
-		if err != nil {
-			return Page{}, fmt.Errorf("list tasks: %w", err)
-		}
-		tasks = append(tasks, task)
-	}
-	if err := rows.Err(); err != nil {
-		return Page{}, fmt.Errorf("list tasks: %w", err)
-	}
-
-	hasNext := len(tasks) > limit
-	if hasNext {
-		tasks = tasks[:limit]
-	}
-	return Page{Tasks: tasks, Limit: limit, Offset: filter.Offset, HasNext: hasNext}, nil
-}
-
-// Patch updates the given fields; nil fields stay unchanged.
-type Patch struct {
-	Name    *string
-	Content *string
-	Status  *Status
-}
-
-// Update applies a patch and returns the stored task.
-func (s *Store) Update(ctx context.Context, id int64, patch Patch) (Task, error) {
-	if id <= 0 {
-		return Task{}, fmt.Errorf("id must be a positive integer")
-	}
-	if patch.Name == nil && patch.Content == nil && patch.Status == nil {
-		return Task{}, fmt.Errorf("at least one of name, content or status is required")
-	}
-	if patch.Name != nil {
-		name, err := validateName(*patch.Name)
-		if err != nil {
-			return Task{}, err
-		}
-		patch.Name = &name
-	}
-	if patch.Content != nil {
-		if err := validateContent(*patch.Content); err != nil {
-			return Task{}, err
-		}
-	}
-	if patch.Status != nil && !patch.Status.Valid() {
-		return Task{}, fmt.Errorf("unknown status %q", *patch.Status)
-	}
-
-	var updated Task
-	err := s.withWriteTx(ctx, func(conn *sql.Conn) error {
-		current, err := getTask(ctx, conn, id, "update task")
-		if err != nil {
-			return err
-		}
-		// A done task is a closed record: its text must not change. Repeating
-		// its status is allowed and changes nothing, everything else is rejected
-		// by the transition check below.
-		if current.Status == StatusDone && (patch.Name != nil || patch.Content != nil) {
-			return fmt.Errorf("task %d is done and cannot be changed", id)
-		}
-
-		sets := make([]string, 0, 3)
-		args := make([]any, 0, 5)
-		if patch.Name != nil {
-			sets = append(sets, "name = ?")
-			args = append(args, *patch.Name)
-		}
-		if patch.Content != nil {
-			sets = append(sets, "content = ?")
-			args = append(args, *patch.Content)
-		}
-		if patch.Status != nil {
-			// Checked against the row read in this transaction, not a snapshot.
-			if !current.Status.CanTransitionTo(*patch.Status) {
-				return fmt.Errorf("cannot change status from %s to %s", current.Status, *patch.Status)
-			}
-			sets = append(sets, "status = ?")
-			args = append(args, string(*patch.Status))
-		}
-		// Only changed columns are written; the status guard pins the write to
-		// the version that was read. Inside this transaction it cannot fire — it
-		// is the safety net for a writer that bypasses withWriteTx.
-		args = append(args, id, string(current.Status))
-		// Column names come from the fixed list above; values stay parameterised.
-		result, err := conn.ExecContext(ctx,
-			`UPDATE tasks SET `+strings.Join(sets, ", ")+` WHERE id = ? AND status = ?`, args...) //nolint:gosec // SQL is assembled from constant column names only
-		if err != nil {
-			return fmt.Errorf("update task: %w", err)
-		}
-		affected, err := result.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("update task: %w", err)
-		}
-		if affected == 0 {
-			return fmt.Errorf("task %d not found", id)
-		}
-
-		// Return the row as stored, not the values computed from the read.
-		updated, err = getTask(ctx, conn, id, "update task")
-		return err
-	})
-	if err != nil {
-		return Task{}, err
-	}
-	return updated, nil
-}
-
-// withWriteTx runs fn inside BEGIN IMMEDIATE: the write lock is taken before the
-// first read, so a read-modify-write cannot interleave with another process and
-// no update is lost. fn must reach the database through conn only — the store
-// keeps a single connection, so a query through s.db would wait for the
-// connection this transaction is holding, forever.
-func (s *Store) withWriteTx(ctx context.Context, fn func(conn *sql.Conn) error) error {
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return fmt.Errorf("acquire connection: %w", err)
-	}
-	defer func() { _ = conn.Close() }()
-
-	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
-	}
-	if err := fn(conn); err != nil {
-		s.rollback(ctx, conn)
-		return err
-	}
-	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
-		s.rollback(ctx, conn)
-		return fmt.Errorf("commit transaction: %w", err)
+	if len(text) > MaxTextBytes {
+		return fmt.Errorf("text must be at most %d bytes", MaxTextBytes)
 	}
 	return nil
-}
-
-// rollback undoes the open transaction. When the rollback itself fails, the
-// connection still holds the transaction and must not go back to the pool.
-func (s *Store) rollback(ctx context.Context, conn *sql.Conn) {
-	if _, err := conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK"); err != nil {
-		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
-	}
 }
 
 // rowScanner covers *sql.Row and *sql.Rows.
@@ -439,15 +261,24 @@ func scanTask(row rowScanner) (Task, error) {
 	var (
 		task      Task
 		createdAt string
+		takenAt   sql.NullString
 	)
-	if err := row.Scan(&task.ID, &task.Name, &task.Content, &task.Status, &createdAt); err != nil {
+	if err := row.Scan(&task.ID, &task.Text, &createdAt, &takenAt); err != nil {
 		return Task{}, err
 	}
 	parsed, err := time.Parse(time.RFC3339, createdAt)
 	if err != nil {
-		return Task{}, fmt.Errorf("parse created_at %q: %w", createdAt, err)
+		return Task{}, fmt.Errorf("parse create_at %q: %w", createdAt, err)
 	}
-	task.CreatedAt = parsed.UTC()
+	task.CreateAt = parsed.UTC()
+	if takenAt.Valid {
+		taken, err := time.Parse(time.RFC3339, takenAt.String)
+		if err != nil {
+			return Task{}, fmt.Errorf("parse get_at %q: %w", takenAt.String, err)
+		}
+		utc := taken.UTC()
+		task.GetAt = &utc
+	}
 	return task, nil
 }
 

@@ -38,174 +38,63 @@ type toolHandler func(ctx context.Context, st *store.Store, args json.RawMessage
 
 var toolHandlers = map[string]toolHandler{
 	"create": createTool,
-	"slice":  sliceTool,
 	"get":    getTool,
-	"update": updateTool,
 }
 
 func toolDefinitions() []toolDefinition {
 	return []toolDefinition{
 		{
 			Name:        "create",
-			Description: "Create a task. A new task starts in status create; name and content are required.",
+			Description: "Create a task. It stays unclaimed (get_at null) until get takes it.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"name": map[string]any{
+					"text": map[string]any{
 						"type":        "string",
-						"description": "Task name, must not be empty (at most 1 KiB of UTF-8).",
+						"description": "Task text, must not be empty (at most 1 MiB of UTF-8).",
 						"minLength":   1,
 					},
-					"content": map[string]any{
-						"type":        "string",
-						"description": "Task description (at most 1 MiB of UTF-8).",
-					},
 				},
-				"required":             []string{"name", "content"},
+				"required":             []string{"text"},
 				"additionalProperties": false,
 			},
 		},
 		{
-			Name: "slice",
-			Description: "Slice of tasks ordered by id. Optional status filter and pagination. " +
-				"Returns {tasks, limit, offset, hasNext}.",
+			Name: "get",
+			Description: "Take the oldest task that has not been taken yet (the lowest id with get_at null) " +
+				"and mark it taken. Fails when every task has been taken.",
 			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"status": map[string]any{"type": "string", "enum": statusEnum(), "description": "Only tasks in this status."},
-					"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": store.MaxLimit, "default": store.DefaultLimit},
-					"offset": map[string]any{"type": "integer", "minimum": 0, "default": 0},
-				},
-				"additionalProperties": false,
-			},
-		},
-		{
-			Name:        "get",
-			Description: "Take one task by id.",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"id": map[string]any{"type": "integer", "minimum": 1},
-				},
-				"required":             []string{"id"},
-				"additionalProperties": false,
-			},
-		},
-		{
-			Name: "update",
-			Description: "Update a task. Only the provided fields change. " +
-				"Allowed status moves: create->in_progress, in_progress->create (back for rework), " +
-				"in_progress->done.",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"id":      map[string]any{"type": "integer", "minimum": 1},
-					"name":    map[string]any{"type": "string", "minLength": 1, "description": "Task name (at most 1 KiB of UTF-8)."},
-					"content": map[string]any{"type": "string", "description": "Task description (at most 1 MiB of UTF-8)."},
-					"status":  map[string]any{"type": "string", "enum": statusEnum()},
-				},
-				"required":             []string{"id"},
+				"type":                 "object",
+				"properties":           map[string]any{},
 				"additionalProperties": false,
 			},
 		},
 	}
-}
-
-func statusEnum() []string {
-	statuses := store.Statuses()
-	values := make([]string, len(statuses))
-	for i, status := range statuses {
-		values[i] = string(status)
-	}
-	return values
 }
 
 func createTool(ctx context.Context, st *store.Store, raw json.RawMessage) (any, error) {
 	var args struct {
-		Name    *string `json:"name"`
-		Content *string `json:"content"`
+		Text *string `json:"text"`
 	}
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, err
 	}
-	if args.Name == nil {
-		return nil, requiredArgumentf("name")
+	if args.Text == nil {
+		return nil, requiredArgumentf("text")
 	}
-	if args.Content == nil {
-		return nil, requiredArgumentf("content")
-	}
-	return st.Add(ctx, *args.Name, args.Content)
-}
-
-func sliceTool(ctx context.Context, st *store.Store, raw json.RawMessage) (any, error) {
-	var args struct {
-		Status *string `json:"status"`
-		Limit  *int    `json:"limit"`
-		Offset *int    `json:"offset"`
-	}
-	if err := decodeArgs(raw, &args); err != nil {
-		return nil, err
-	}
-
-	filter := store.ListFilter{}
-	if args.Status != nil {
-		status, err := store.ParseStatus(*args.Status)
-		if err != nil {
-			return nil, err
-		}
-		filter.Status = &status
-	}
-	if args.Limit != nil {
-		if *args.Limit < 1 || *args.Limit > store.MaxLimit {
-			return nil, fmt.Errorf("limit must be between 1 and %d, got %d", store.MaxLimit, *args.Limit)
-		}
-		filter.Limit = *args.Limit
-	}
-	if args.Offset != nil {
-		if *args.Offset < 0 {
-			return nil, fmt.Errorf("offset must not be negative, got %d", *args.Offset)
-		}
-		filter.Offset = *args.Offset
-	}
-	return st.List(ctx, filter)
+	return st.Add(ctx, *args.Text)
 }
 
 func getTool(ctx context.Context, st *store.Store, raw json.RawMessage) (any, error) {
-	var args struct {
-		ID *int64 `json:"id"`
-	}
+	var args struct{}
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, err
 	}
-	if args.ID == nil {
-		return nil, requiredArgumentf("id")
-	}
-	return st.Get(ctx, *args.ID)
-}
-
-func updateTool(ctx context.Context, st *store.Store, raw json.RawMessage) (any, error) {
-	var args struct {
-		ID     *int64  `json:"id"`
-		Status *string `json:"status"`
-	}
-	if err := decodeArgs(raw, &args); err != nil {
-		return nil, err
-	}
-	if args.ID == nil {
-		return nil, requiredArgumentf("id")
-	}
-	if args.Status == nil {
-		return nil, requiredArgumentf("status")
-	}
-	status, err := store.ParseStatus(*args.Status)
-	if err != nil {
-		return nil, err
-	}
-	return st.Update(ctx, *args.ID, store.Patch{Status: &status})
+	return st.Take(ctx)
 }
 
 // requiredArgumentf reports a missing mandatory argument separately from a
-// malformed one: "id is required" is not "id must be a positive integer".
+// malformed one: "text is required" is not "text must not be empty".
 func requiredArgumentf(name string) error {
 	return fmt.Errorf("%s is required", name)
 }

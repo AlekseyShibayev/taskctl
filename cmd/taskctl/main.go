@@ -17,7 +17,7 @@ import (
 // version is overridden at build time with -ldflags "-X main.version=...".
 var version = "dev"
 
-const usage = `taskctl — local task tracker (MCP over stdio)
+const usage = `taskctl — local task queue (MCP over stdio)
 
 Usage:
   taskctl mcp      run the MCP server on stdio
