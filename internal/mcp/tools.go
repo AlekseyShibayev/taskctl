@@ -51,8 +51,9 @@ func toolDefinitions() []toolDefinition {
 				"properties": map[string]any{
 					"text": map[string]any{
 						"type":        "string",
-						"description": "Task text, must not be empty (at most 1 MiB of UTF-8).",
+						"description": "Task text, must not be empty (at most 2000 characters).",
 						"minLength":   1,
+						"maxLength":   store.MaxTextChars,
 					},
 				},
 				"required":             []string{"text"},

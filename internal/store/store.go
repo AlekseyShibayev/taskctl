@@ -17,9 +17,10 @@ import (
 	_ "modernc.org/sqlite" // register the pure-Go sqlite driver
 )
 
-// MaxTextBytes bounds one task: a single row must not be able to grow the
-// database and every MCP response without bound.
-const MaxTextBytes = 1 << 20 // 1 MiB
+// MaxTextChars bounds one task: a single row must not be able to grow the
+// database and every MCP response without bound. Characters, not bytes: a
+// Cyrillic or emoji task must not hit the limit sooner than an ASCII one.
+const MaxTextChars = 2000
 
 // ErrEmpty reports that every stored task has already been taken.
 var ErrEmpty = errors.New("queue is empty: every task has been taken")
@@ -246,8 +247,8 @@ func validateText(text string) error {
 	if !utf8.ValidString(text) {
 		return errors.New("text must be valid UTF-8")
 	}
-	if len(text) > MaxTextBytes {
-		return fmt.Errorf("text must be at most %d bytes", MaxTextBytes)
+	if utf8.RuneCountInString(text) > MaxTextChars {
+		return fmt.Errorf("text must be at most %d characters", MaxTextChars)
 	}
 	return nil
 }

@@ -100,7 +100,7 @@ func TestAddValidation(t *testing.T) {
 			t.Errorf("add %q succeeded", text)
 		}
 	}
-	tooLong := strings.Repeat("x", store.MaxTextBytes+1)
+	tooLong := strings.Repeat("x", store.MaxTextChars+1)
 	_, err := st.Add(ctx, tooLong)
 	requireError(t, err)
 
@@ -108,9 +108,26 @@ func TestAddValidation(t *testing.T) {
 		t.Fatalf("invalid adds persisted a task: err = %v", err)
 	}
 
-	exact := strings.Repeat("x", store.MaxTextBytes)
+	exact := strings.Repeat("x", store.MaxTextChars)
 	if _, err := st.Add(ctx, exact); err != nil {
 		t.Errorf("text at the limit: %v", err)
+	}
+}
+
+// The limit counts characters, not bytes: 2000 emoji are 2000 characters and
+// 8000 bytes, and must still fit.
+func TestTextLimitCountsCharacters(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	emoji := strings.Repeat("🚀", store.MaxTextChars)
+	if _, err := st.Add(ctx, emoji); err != nil {
+		t.Fatalf("2000 emoji: %v", err)
+	}
+
+	_, err := st.Add(ctx, emoji+"🚀")
+	if want := "text must be at most 2000 characters"; err == nil || err.Error() != want {
+		t.Fatalf("2001 emoji: err = %v, want %q", err, want)
 	}
 }
 
