@@ -1,6 +1,6 @@
 # taskctl
 
-<img src="assets/banner.svg?v=12" alt="taskctl" width="800" valign="middle">
+![taskctl](assets/banner.svg)
 
 Локальный трекер задач для агента: MCP поверх stdio, SQLite на рабочей машине,
 без сети. ОС: Linux.
