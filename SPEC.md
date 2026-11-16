@@ -1,40 +1,36 @@
 # taskctl — спецификация
 
-## `create(text)`
+## MCP-инструменты
 
-Кладёт задачу в очередь. Созданная задача не взята: `get_at: null`.
+```yaml
+tools:
+  create:
+    description: Кладёт задачу в очередь, ничего не возвращает.
+    input:
+      text: { type: string, minLength: 1, maxLength: 2000, pattern: '\S' }
+    errors:
+      - { id: C1, when: "пустая строка или одни пробелы", message: "text must not be empty" }
+      - { id: C2, when: "длиннее 2000 символов", message: "text must be at most 2000 characters" }
 
-**Аргументы**
-
-| Имя | Тип | Обяз. | Ограничения |
-|---|---|---|---|
-| `text` | string | да | 1…2000 символов, не только пробелы |
-
-- Считаются символы Unicode, а не байты: 2000 эмодзи — это 2000 символов.
-- `text` хранится и возвращается как передан: пробелы по краям не обрезаются.
-- Лишние поля в аргументах отклоняются, а не игнорируются.
-
-**Результат**
-
-JSON в `content[0].text` — сохранённая задача:
-
-```json
-{"id": 1, "text": "fix doctor", "create_at": "2026-11-16T12:00:00Z", "get_at": null}
+  get:
+    description: "Забирает самую старую свободную задачу (ту, у которой get_at не заполнен), проставляет ей get_at и возвращает её текст. Если свободных задач нет, возвращает текст no tasks."
+    output: { type: string }
+    ordering: [create_at asc, id asc]
+    empty: "no tasks"
 ```
 
-- `id` монотонно растёт; разрывы допустимы.
-- `create_at` — часы сервера, UTC, до секунды.
-- Дедупликации нет: два `create` с одним и тем же `text` создают две задачи.
-- `tools/call` без `id` (notification) не исполняется: задача не создаётся.
+## Схема БД
 
-**Ошибки**
-
-Все ошибки — результат инструмента с `isError: true`, текст в `content[0].text`.
-
-| ID | Условие | Сообщение |
-|---|---|---|
-| C1 | аргумент отсутствует или `null` | `text is required` |
-| C2 | пустая строка или одни пробелы | `text must not be empty` |
-| C3 | больше 2000 символов | `text must be at most 2000 characters` |
-| C4 | неизвестное поле в аргументах | `invalid arguments: <причина>` |
-| C5 | невалидный UTF-8 | `text must be valid UTF-8` (по MCP недостижимо: декодер заменяет байты на U+FFFD) |
+```yaml
+tables:
+  tasks:
+    columns:
+      id: { type: integer, primary_key: true, autoincrement: true }
+      text: { type: text, not_null: true }
+      create_at: { type: text, not_null: true, format: "ISO 8601, UTC" }
+      get_at: { type: text, nullable: true, format: "ISO 8601, UTC", default: null }
+    indexes:
+      tasks_free:
+        columns: [create_at, id]
+        where: "get_at IS NULL"
+```
