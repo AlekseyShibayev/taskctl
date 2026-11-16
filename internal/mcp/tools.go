@@ -4,10 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/AlekseyShibayev/taskctl/internal/store"
 )
+
+// errInvalidArguments marks a malformed tools/call payload: it becomes a
+// JSON-RPC -32602 error, not a tool result.
+var errInvalidArguments = errors.New("invalid arguments")
 
 type toolDefinition struct {
 	Name        string         `json:"name"`
@@ -34,7 +39,7 @@ type callToolParams struct {
 	Arguments json.RawMessage `json:"arguments"`
 }
 
-type toolHandler func(ctx context.Context, st *store.Store, args json.RawMessage) (any, error)
+type toolHandler func(ctx context.Context, st *store.Store, args json.RawMessage) (toolResult, error)
 
 var toolHandlers = map[string]toolHandler{
 	"create": createTool,
@@ -45,15 +50,13 @@ func toolDefinitions() []toolDefinition {
 	return []toolDefinition{
 		{
 			Name:        "create",
-			Description: "Create a task. It stays unclaimed (get_at null) until get takes it.",
+			Description: "Queue a task from text. The task stays queued until get takes it.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"text": map[string]any{
 						"type":        "string",
-						"description": "Task text, must not be empty (at most 2000 characters).",
-						"minLength":   1,
-						"maxLength":   store.MaxTextChars,
+						"description": "Task text.",
 					},
 				},
 				"required":             []string{"text"},
@@ -61,9 +64,8 @@ func toolDefinitions() []toolDefinition {
 			},
 		},
 		{
-			Name: "get",
-			Description: "Take the oldest task that has not been taken yet (the lowest id with get_at null) " +
-				"and mark it taken. Fails when every task has been taken.",
+			Name:        "get",
+			Description: "Take the next task and return its text. Fails when every task has been taken.",
 			InputSchema: map[string]any{
 				"type":                 "object",
 				"properties":           map[string]any{},
@@ -73,31 +75,32 @@ func toolDefinitions() []toolDefinition {
 	}
 }
 
-func createTool(ctx context.Context, st *store.Store, raw json.RawMessage) (any, error) {
+func createTool(ctx context.Context, st *store.Store, raw json.RawMessage) (toolResult, error) {
 	var args struct {
 		Text *string `json:"text"`
 	}
 	if err := decodeArgs(raw, &args); err != nil {
-		return nil, err
+		return toolResult{}, err
 	}
 	if args.Text == nil {
-		return nil, requiredArgumentf("text")
+		return toolResult{}, errors.New("text is required")
 	}
-	return st.Add(ctx, *args.Text)
+	if err := st.Create(ctx, *args.Text); err != nil {
+		return toolResult{}, err
+	}
+	return emptyResult(), nil
 }
 
-func getTool(ctx context.Context, st *store.Store, raw json.RawMessage) (any, error) {
+func getTool(ctx context.Context, st *store.Store, raw json.RawMessage) (toolResult, error) {
 	var args struct{}
 	if err := decodeArgs(raw, &args); err != nil {
-		return nil, err
+		return toolResult{}, err
 	}
-	return st.Take(ctx)
-}
-
-// requiredArgumentf reports a missing mandatory argument separately from a
-// malformed one: "text is required" is not "text must not be empty".
-func requiredArgumentf(name string) error {
-	return fmt.Errorf("%s is required", name)
+	text, err := st.Get(ctx)
+	if err != nil {
+		return toolResult{}, err
+	}
+	return textResult(text), nil
 }
 
 // decodeArgs decodes tool arguments strictly, rejecting unknown fields.
@@ -108,28 +111,18 @@ func decodeArgs(raw json.RawMessage, dst any) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(dst); err != nil {
-		return fmt.Errorf("invalid arguments: %w", err)
+		return fmt.Errorf("%w: %v", errInvalidArguments, err)
 	}
 	return nil
 }
 
-// decodeParams is lenient: MCP allows _meta and other protocol fields in params.
-func decodeParams(raw json.RawMessage, dst any) error {
-	if len(raw) == 0 || string(raw) == "null" {
-		raw = json.RawMessage("{}")
-	}
-	if err := json.Unmarshal(raw, dst); err != nil {
-		return fmt.Errorf("invalid params: %w", err)
-	}
-	return nil
+func textResult(text string) toolResult {
+	return toolResult{Content: []contentBlock{{Type: "text", Text: text}}}
 }
 
-func jsonResult(payload any) toolResult {
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return errorResult(err)
-	}
-	return toolResult{Content: []contentBlock{{Type: "text", Text: string(data)}}}
+// emptyResult is a successful tool call with no content, used by create.
+func emptyResult() toolResult {
+	return toolResult{Content: []contentBlock{}}
 }
 
 func errorResult(err error) toolResult {

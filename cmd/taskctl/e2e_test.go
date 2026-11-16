@@ -64,20 +64,27 @@ func TestStdioSmoke(t *testing.T) {
 		}
 		return envelope
 	}
-	toolText := func(envelope map[string]any) (map[string]any, bool) {
+	toolContent := func(envelope map[string]any) ([]any, bool) {
 		t.Helper()
 		result, _ := envelope["result"].(map[string]any)
 		content, _ := result["content"].([]any)
+		isError, _ := result["isError"].(bool)
+		return content, isError
+	}
+	toolText := func(envelope map[string]any) (string, bool) {
+		t.Helper()
+		content, isError := toolContent(envelope)
 		if len(content) != 1 {
 			t.Fatalf("content = %v", content)
 		}
-		text := content[0].(map[string]any)["text"].(string)
-		isError, _ := result["isError"].(bool)
-		var payload map[string]any
-		if err := json.Unmarshal([]byte(text), &payload); err != nil {
-			return map[string]any{"message": text}, isError
+		return content[0].(map[string]any)["text"].(string), isError
+	}
+	requireNoContent := func(envelope map[string]any) {
+		t.Helper()
+		content, isError := toolContent(envelope)
+		if isError || len(content) != 0 {
+			t.Fatalf("create result = %v", envelope)
 		}
-		return payload, isError
 	}
 
 	init := request(1, "initialize", map[string]any{"protocolVersion": "2025-06-18"})
@@ -97,30 +104,21 @@ func TestStdioSmoke(t *testing.T) {
 	created := request(3, "tools/call", map[string]any{
 		"name": "create", "arguments": map[string]any{"text": "smoke task"},
 	})
-	payload, _ := toolText(created)
-	if payload["id"] != float64(1) || payload["text"] != "smoke task" || payload["get_at"] != nil {
-		t.Fatalf("create = %v", payload)
-	}
+	requireNoContent(created)
 
 	second := request(4, "tools/call", map[string]any{
 		"name": "create", "arguments": map[string]any{"text": "second task"},
 	})
-	if payload, _ := toolText(second); payload["id"] != float64(2) {
-		t.Fatalf("second create = %v", payload)
-	}
+	requireNoContent(second)
 
 	taken := request(5, "tools/call", map[string]any{"name": "get", "arguments": map[string]any{}})
-	payload, isError := toolText(taken)
-	if isError || payload["id"] != float64(1) || payload["text"] != "smoke task" {
-		t.Fatalf("first get = %v", payload)
-	}
-	if when, ok := payload["get_at"].(string); !ok || when == "" {
-		t.Fatalf("get_at = %v", payload["get_at"])
+	if text, isError := toolText(taken); isError || text != "smoke task" {
+		t.Fatalf("first get = %q, isError = %v", text, isError)
 	}
 
 	next := request(6, "tools/call", map[string]any{"name": "get", "arguments": map[string]any{}})
-	if payload, _ := toolText(next); payload["id"] != float64(2) {
-		t.Fatalf("second get = %v", payload)
+	if text, isError := toolText(next); isError || text != "second task" {
+		t.Fatalf("second get = %q, isError = %v", text, isError)
 	}
 
 	empty := request(7, "tools/call", map[string]any{"name": "get", "arguments": map[string]any{}})

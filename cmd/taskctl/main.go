@@ -5,10 +5,8 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/AlekseyShibayev/taskctl/internal/mcp"
 	"github.com/AlekseyShibayev/taskctl/internal/store"
@@ -28,12 +26,10 @@ The database is created on the first session.
 `
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	os.Exit(run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
-func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		_, _ = fmt.Fprint(stderr, usage)
 		return 2
@@ -41,41 +37,26 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 
 	switch args[0] {
 	case "mcp":
-		return runMCP(ctx, stdin, stdout, stderr)
+		return runMCP(stdin, stdout, stderr)
 	default:
 		_, _ = fmt.Fprintf(stderr, "taskctl: unknown command %q\n\n%s", args[0], usage)
 		return 2
 	}
 }
 
-func runMCP(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) int {
+func runMCP(stdin io.Reader, stdout, stderr io.Writer) int {
 	st, err := openStore()
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "taskctl: %v\n", err)
 		return 1
 	}
+	defer func() { _ = st.Close() }()
 
-	server := mcp.NewServer(st, version)
-	done := make(chan error, 1)
-	go func() { done <- server.Serve(ctx, stdin, stdout) }()
-
-	select {
-	case err := <-done:
-		if closeErr := st.Close(); closeErr != nil {
-			_, _ = fmt.Fprintf(stderr, "taskctl: %v\n", closeErr)
-			return 1
-		}
-		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "taskctl: %v\n", err)
-			return 1
-		}
-		return 0
-	case <-ctx.Done():
-		// A client that closed the session leaves us blocked on stdin; the
-		// process is about to exit, so only the WAL checkpoint matters here.
-		_ = st.Close()
-		return 0
+	if err := mcp.NewServer(st, version).Serve(context.Background(), stdin, stdout); err != nil {
+		_, _ = fmt.Fprintf(stderr, "taskctl: %v\n", err)
+		return 1
 	}
+	return 0
 }
 
 func openStore() (*store.Store, error) {
