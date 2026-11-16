@@ -1,6 +1,6 @@
 # taskctl
 
-![taskctl](assets/banner.svg)
+![taskctl](https://raw.githubusercontent.com/AlekseyShibayev/taskctl/main/assets/banner.svg)
 
 Локальный трекер задач для агента: MCP поверх stdio, SQLite на рабочей машине,
 без сети. ОС: Linux.
