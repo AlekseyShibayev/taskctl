@@ -52,25 +52,51 @@ func NewServer(st *store.Store, version string) *Server {
 	return &Server{store: st, version: version}
 }
 
-// Serve reads newline-delimited JSON-RPC messages until EOF. A malformed
-// message is answered and does not stop the stream.
+// Serve reads newline-delimited JSON-RPC messages until EOF or until ctx is
+// cancelled. A malformed message is answered and does not stop the stream.
 func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
-	reader := bufio.NewReader(r)
-	encoder := json.NewEncoder(w)
-	for {
-		line, readErr := reader.ReadString('\n')
-		if strings.TrimSpace(line) != "" {
-			if resp, ok := s.handle(ctx, []byte(line)); ok {
-				if err := encoder.Encode(resp); err != nil {
-					return fmt.Errorf("write response: %w", err)
-				}
+	type readResult struct {
+		line []byte
+		err  error
+	}
+	// Reading happens in a goroutine so that a cancelled context (SIGTERM)
+	// ends the session without waiting for the next line. The goroutine exits
+	// with the process if it is still blocked in ReadString.
+	reads := make(chan readResult)
+	go func() {
+		reader := bufio.NewReader(r)
+		for {
+			line, err := reader.ReadString('\n')
+			select {
+			case reads <- readResult{line: []byte(line), err: err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
 			}
 		}
-		if readErr != nil {
-			if errors.Is(readErr, io.EOF) {
-				return nil
+	}()
+
+	encoder := json.NewEncoder(w)
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case res := <-reads:
+			if strings.TrimSpace(string(res.line)) != "" {
+				if resp, ok := s.handle(ctx, res.line); ok {
+					if err := encoder.Encode(resp); err != nil {
+						return fmt.Errorf("write response: %w", err)
+					}
+				}
 			}
-			return fmt.Errorf("read request: %w", readErr)
+			if res.err != nil {
+				if errors.Is(res.err, io.EOF) {
+					return nil
+				}
+				return fmt.Errorf("read request: %w", res.err)
+			}
 		}
 	}
 }

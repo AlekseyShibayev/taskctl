@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -173,5 +174,67 @@ func TestRelativePath(t *testing.T) {
 	mustCreate(t, st, "task")
 	if got := mustGet(t, st); got != "task" {
 		t.Fatalf("get = %q", got)
+	}
+}
+
+// An existing directory and database file must be tightened on open.
+func TestOpenTightensPermissions(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "taskctl")
+	if err := os.Mkdir(dataDir, 0o755); err != nil {
+		t.Fatalf("create directory: %v", err)
+	}
+	path := filepath.Join(dataDir, "tasks.db")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatalf("create database file: %v", err)
+	}
+
+	st := open(t, path)
+	mustCreate(t, st, "task")
+
+	for name, want := range map[string]os.FileMode{
+		dataDir:       0o700,
+		path:          0o600,
+		path + "-wal": 0o600,
+		path + "-shm": 0o600,
+	} {
+		info, err := os.Stat(name)
+		if err != nil {
+			t.Fatalf("stat %s: %v", filepath.Base(name), err)
+		}
+		if got := info.Mode().Perm(); got != want {
+			t.Errorf("%s mode = %o, want %o", filepath.Base(name), got, want)
+		}
+	}
+}
+
+// Concurrent first opens must serialise on the directory lock.
+func TestConcurrentOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.db")
+
+	const openers = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, openers)
+	stores := make([]*store.Store, openers)
+	for i := range stores {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			st, err := store.Open(path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			stores[i] = st
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("open: %v", err)
+	}
+	for _, st := range stores {
+		if st != nil {
+			_ = st.Close()
+		}
 	}
 }

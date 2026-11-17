@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/AlekseyShibayev/taskctl/internal/mcp"
 	"github.com/AlekseyShibayev/taskctl/internal/store"
@@ -26,10 +28,18 @@ The database is created on the first session.
 `
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	// SIGTERM/SIGINT end the session cleanly, so the WAL is checkpointed.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	os.Exit(runContext(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
+// run is the signal-free entry point used by tests.
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	return runContext(context.Background(), args, stdin, stdout, stderr)
+}
+
+func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		_, _ = fmt.Fprint(stderr, usage)
 		return 2
@@ -37,14 +47,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	switch args[0] {
 	case "mcp":
-		return runMCP(stdin, stdout, stderr)
+		return runMCP(ctx, stdin, stdout, stderr)
 	default:
 		_, _ = fmt.Fprintf(stderr, "taskctl: unknown command %q\n\n%s", args[0], usage)
 		return 2
 	}
 }
 
-func runMCP(stdin io.Reader, stdout, stderr io.Writer) int {
+func runMCP(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) int {
 	st, err := openStore()
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "taskctl: %v\n", err)
@@ -52,7 +62,8 @@ func runMCP(stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	defer func() { _ = st.Close() }()
 
-	if err := mcp.NewServer(st, version).Serve(context.Background(), stdin, stdout); err != nil {
+	err = mcp.NewServer(st, version).Serve(ctx, stdin, stdout)
+	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "taskctl: %v\n", err)
 		return 1
 	}
